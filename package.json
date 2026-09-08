@@ -1,0 +1,15 @@
+{
+  "name": "xauusd-signal-dashboard",
+  "version": "1.0.0",
+  "description": "Always-on XAUUSD signal bot with Telegram alerts and a live web dashboard",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

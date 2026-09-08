@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>XAUUSD Signal Desk</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="desk">
+
+    <header class="desk__header">
+      <div class="desk__brand">
+        <span class="desk__mark">Au</span>
+        <div>
+          <h1>Signal Desk</h1>
+          <p id="pair-line">XAU/USD &middot; 15min &middot; EMA 9/21 + RSI</p>
+        </div>
+      </div>
+      <div class="desk__pulse" id="pulse">
+        <span class="pulse__dot"></span>
+        <span id="pulse-text">connecting</span>
+      </div>
+    </header>
+
+    <main class="desk__grid">
+
+      <section class="panel panel--price">
+        <div class="panel__label">Last price</div>
+        <div class="price" id="price">&mdash;</div>
+        <svg id="spark" class="spark" viewBox="0 0 400 90" preserveAspectRatio="none"></svg>
+        <div class="price__meta" id="checked-at">waiting for first check&hellip;</div>
+      </section>
+
+      <section class="panel panel--signal" id="signal-panel">
+        <div class="panel__label">Current signal</div>
+        <div class="signal" id="signal-word">NONE</div>
+        <div class="signal__targets" id="signal-targets"></div>
+      </section>
+
+      <section class="panel panel--readout">
+        <div class="panel__label">Readout</div>
+        <dl class="readout">
+          <div><dt>RSI (14)</dt><dd id="rsi-val">&mdash;</dd></div>
+          <div><dt>EMA 9</dt><dd id="ema-fast">&mdash;</dd></div>
+          <div><dt>EMA 21</dt><dd id="ema-slow">&mdash;</dd></div>
+          <div><dt>ATR (14)</dt><dd id="atr-val">&mdash;</dd></div>
+        </dl>
+      </section>
+
+      <section class="panel panel--history">
+        <div class="panel__label">Signal history</div>
+        <ul class="history" id="history-list">
+          <li class="history__empty">No signals fired yet.</li>
+        </ul>
+      </section>
+
+    </main>
+
+    <footer class="desk__footer">
+      Alerts are pushed to Telegram the moment a crossover confirms &mdash; this page is a window onto that, not the trigger. Signal only, not financial advice.
+    </footer>
+
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
