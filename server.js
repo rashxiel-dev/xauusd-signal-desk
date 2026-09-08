@@ -1,11 +1,12 @@
 /**
  * XAUUSD Signal Bot — Web Backend
  * --------------------------------
- * Runs the same EMA/RSI/ATR signal logic as the standalone script, but as
- * an always-on web server: it keeps polling and sending Telegram alerts
- * on its own schedule (independent of whether anyone has the dashboard
- * open), and also serves a JSON API + static dashboard so you can check
- * status from a browser.
+ * Runs the EMA/RSI/ATR signal logic as an always-on web server: keeps
+ * polling and sending Telegram alerts on its own schedule (independent
+ * of whether anyone has the dashboard open), and serves a JSON API +
+ * dashboard with a "signal map" — H4 context chart + entry-timeframe
+ * chart, each with an auto-drawn trendline, plus the reasoning behind
+ * the current signal.
  *
  * Requires Node 18+ (uses the built-in fetch).
  */
@@ -19,7 +20,8 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 
 const SYMBOL = process.env.SYMBOL || "XAU/USD";
-const INTERVAL = process.env.INTERVAL || "15min"; // 1min,5min,15min,30min,1h,4h,1day
+const INTERVAL = process.env.INTERVAL || "15min"; // entry timeframe
+const HIGH_INTERVAL = process.env.HIGH_INTERVAL || "4h"; // context timeframe
 const PORT = process.env.PORT || 3000;
 
 const EMA_FAST = 9;
@@ -28,12 +30,13 @@ const RSI_PERIOD = 14;
 const ATR_PERIOD = 14;
 const RSI_OVERBOUGHT = 75;
 const RSI_OVERSOLD = 25;
+const SWING_WINDOW = 2; // candles on each side to qualify as a swing point
 
 const POLL_MS = 15 * 60 * 1000; // check every 15 minutes
 
 // ---------------- In-memory state ----------------
 const state = {
-  status: "starting", // starting | ok | error
+  status: "starting",
   lastChecked: null,
   lastError: null,
   symbol: SYMBOL,
@@ -43,20 +46,21 @@ const state = {
   emaFast: null,
   emaSlow: null,
   atr: null,
-  signal: null, // BUY | SELL | null
+  signal: null,
   suggestedSL: null,
   suggestedTP: null,
   lastSignal: null,
   lastSignalTime: null,
-  history: [], // { time, signal, price }[]
-  sparkline: [], // recent closes for the mini chart
+  history: [],
+  sparkline: [],
+  chartMap: null, // { context: {...}, entry: {...}, reason: "" }
 };
 
 // ---------------- Data ----------------
-async function fetchCandles(n = 100) {
+async function fetchCandles(interval, n = 100) {
   const url = new URL("https://api.twelvedata.com/time_series");
   url.searchParams.set("symbol", SYMBOL);
-  url.searchParams.set("interval", INTERVAL);
+  url.searchParams.set("interval", interval);
   url.searchParams.set("outputsize", n);
   url.searchParams.set("apikey", TWELVE_DATA_API_KEY);
   url.searchParams.set("order", "ASC");
@@ -64,7 +68,7 @@ async function fetchCandles(n = 100) {
   const res = await fetch(url);
   const data = await res.json();
   if (!data.values) {
-    throw new Error(`Twelve Data error: ${JSON.stringify(data)}`);
+    throw new Error(`Twelve Data error (${interval}): ${JSON.stringify(data)}`);
   }
   return data.values.map((v) => ({
     datetime: v.datetime,
@@ -127,6 +131,77 @@ function atr(candles, period) {
   return out;
 }
 
+// ---------------- Trendline detection ----------------
+function findSwingHighs(candles, window = SWING_WINDOW) {
+  const pts = [];
+  for (let i = window; i < candles.length - window; i++) {
+    const h = candles[i].high;
+    let isSwing = true;
+    for (let w = 1; w <= window; w++) {
+      if (candles[i - w].high >= h || candles[i + w].high >= h) {
+        isSwing = false;
+        break;
+      }
+    }
+    if (isSwing) pts.push({ index: i, price: h });
+  }
+  return pts;
+}
+
+function findSwingLows(candles, window = SWING_WINDOW) {
+  const pts = [];
+  for (let i = window; i < candles.length - window; i++) {
+    const l = candles[i].low;
+    let isSwing = true;
+    for (let w = 1; w <= window; w++) {
+      if (candles[i - w].low <= l || candles[i + w].low <= l) {
+        isSwing = false;
+        break;
+      }
+    }
+    if (isSwing) pts.push({ index: i, price: l });
+  }
+  return pts;
+}
+
+function linearRegression(points) {
+  const n = points.length;
+  if (n < 2) return null;
+  const sumX = points.reduce((a, p) => a + p.index, 0);
+  const sumY = points.reduce((a, p) => a + p.price, 0);
+  const sumXY = points.reduce((a, p) => a + p.index * p.price, 0);
+  const sumXX = points.reduce((a, p) => a + p.index * p.index, 0);
+  const denom = n * sumXX - sumX * sumX;
+  if (denom === 0) return null;
+  const slope = (n * sumXY - sumX * sumY) / denom;
+  const intercept = (sumY - slope * sumX) / n;
+  return { slope, intercept };
+}
+
+// Fits a resistance line through swing highs (downtrend) or a support
+// line through swing lows (uptrend), spanning the full candle window.
+function buildTrendline(candles, bias) {
+  const pts = bias === "down" ? findSwingHighs(candles) : findSwingLows(candles);
+  const usable = pts.length >= 2 ? pts : bias === "down" ? findSwingHighs(candles, 1) : findSwingLows(candles, 1);
+  const reg = linearRegression(usable);
+  if (!reg) return null;
+
+  const firstIndex = 0;
+  const lastIndex = candles.length - 1;
+  return {
+    p1: { index: firstIndex, price: reg.slope * firstIndex + reg.intercept },
+    p2: { index: lastIndex, price: reg.slope * lastIndex + reg.intercept },
+  };
+}
+
+// Overall bias for a candle set: slope of a regression through closes.
+function closesBias(candles) {
+  const pts = candles.map((c, i) => ({ index: i, price: c.close }));
+  const reg = linearRegression(pts);
+  if (!reg) return "flat";
+  return reg.slope < 0 ? "down" : "up";
+}
+
 // ---------------- Telegram ----------------
 async function sendTelegram(message) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -159,15 +234,36 @@ function formatMessage(signal, price, rsiVal, atrVal, time) {
   );
 }
 
+function formatReason(signal, price, rsiVal, bias) {
+  if (signal === "SELL") {
+    return `EMA${EMA_FAST} crossed below EMA${EMA_SLOW} with RSI at ${rsiVal.toFixed(
+      1
+    )} — bearish momentum confirmed near the resistance trendline.`;
+  }
+  if (signal === "BUY") {
+    return `EMA${EMA_FAST} crossed above EMA${EMA_SLOW} with RSI at ${rsiVal.toFixed(
+      1
+    )} — bullish momentum confirmed near the support trendline.`;
+  }
+  return `No active crossover — price is ${
+    bias === "down" ? "testing resistance" : "testing support"
+  } near ${price.toFixed(2)}, EMA${EMA_FAST}/${EMA_SLOW} still trending ${
+    bias === "down" ? "down" : "up"
+  }.`;
+}
+
 // ---------------- Core check ----------------
 async function checkOnce() {
-  const candles = await fetchCandles(100);
-  const closes = candles.map((c) => c.close);
+  const [entryCandles, contextCandles] = await Promise.all([
+    fetchCandles(INTERVAL, 100),
+    fetchCandles(HIGH_INTERVAL, 80),
+  ]);
 
+  const closes = entryCandles.map((c) => c.close);
   const emaFastArr = ema(closes, EMA_FAST);
   const emaSlowArr = ema(closes, EMA_SLOW);
   const rsiArr = rsi(closes, RSI_PERIOD);
-  const atrArr = atr(candles, ATR_PERIOD);
+  const atrArr = atr(entryCandles, ATR_PERIOD);
 
   const i = closes.length - 1;
   const prevI = i - 1;
@@ -182,7 +278,7 @@ async function checkOnce() {
   else if (crossedDown && rsiArr[i] > RSI_OVERSOLD) signal = "SELL";
 
   const price = closes[i];
-  const time = candles[i].datetime;
+  const time = entryCandles[i].datetime;
 
   state.price = price;
   state.rsi = rsiArr[i];
@@ -215,6 +311,39 @@ async function checkOnce() {
   } else {
     console.log(`[${new Date().toISOString()}] No new signal (current: ${signal})`);
   }
+
+  // ---- Signal map: entry chart + context chart, each with a trendline ----
+  const entryBias = state.lastSignal === "SELL" ? "down" : state.lastSignal === "BUY" ? "up" : closesBias(entryCandles);
+  const contextBias = closesBias(contextCandles);
+
+  const entryTrendline = buildTrendline(entryCandles, entryBias);
+  const contextTrendline = buildTrendline(contextCandles, contextBias);
+
+  let signalIndex = null;
+  if (state.lastSignal && state.lastSignalTime) {
+    const idx = entryCandles.findIndex((c) => c.datetime === state.lastSignalTime);
+    if (idx >= 0) signalIndex = idx;
+  }
+
+  state.chartMap = {
+    reason: formatReason(state.lastSignal, price, rsiArr[i], entryBias),
+    entry: {
+      interval: INTERVAL,
+      candles: entryCandles.map((c) => ({ o: c.open, h: c.high, l: c.low, c: c.close, t: c.datetime })),
+      emaFast: emaFastArr,
+      emaSlow: emaSlowArr,
+      trendline: entryTrendline,
+      bias: entryBias,
+      signalIndex,
+      signalType: state.lastSignal,
+    },
+    context: {
+      interval: HIGH_INTERVAL,
+      candles: contextCandles.map((c) => ({ o: c.open, h: c.high, l: c.low, c: c.close, t: c.datetime })),
+      trendline: contextTrendline,
+      bias: contextBias,
+    },
+  };
 }
 
 async function pollLoop() {
