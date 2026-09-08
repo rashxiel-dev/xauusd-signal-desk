@@ -37,6 +37,94 @@ function drawSpark(values) {
   svg.innerHTML = `<path d="M${points.join(" L")}" />`;
 }
 
+// ---------------- Candlestick chart ----------------
+function drawChart(svgId, panel, opts = {}) {
+  const svg = document.getElementById(svgId);
+  if (!panel || !panel.candles || panel.candles.length === 0) {
+    svg.innerHTML = "";
+    return;
+  }
+
+  const W = 500, H = 300;
+  const padTop = 14, padBottom = 14, padLeft = 6, padRight = 6;
+  const candles = panel.candles;
+  const n = candles.length;
+
+  let min = Math.min(...candles.map((c) => c.l));
+  let max = Math.max(...candles.map((c) => c.h));
+  if (panel.trendline) {
+    min = Math.min(min, panel.trendline.p1.price, panel.trendline.p2.price);
+    max = Math.max(max, panel.trendline.p1.price, panel.trendline.p2.price);
+  }
+  const range = max - min || 1;
+
+  const plotW = W - padLeft - padRight;
+  const plotH = H - padTop - padBottom;
+  const step = plotW / n;
+  const bodyW = Math.max(1.5, step * 0.55);
+
+  const xAt = (i) => padLeft + i * step + step / 2;
+  const yAt = (price) => padTop + plotH - ((price - min) / range) * plotH;
+
+  let svgParts = [];
+
+  // candles
+  candles.forEach((c, i) => {
+    const x = xAt(i);
+    const up = c.c >= c.o;
+    const yHigh = yAt(c.h);
+    const yLow = yAt(c.l);
+    const yOpen = yAt(c.o);
+    const yClose = yAt(c.c);
+    const bodyTop = Math.min(yOpen, yClose);
+    const bodyH = Math.max(1, Math.abs(yClose - yOpen));
+
+    svgParts.push(
+      `<line class="${up ? "wick-up" : "wick-down"}" x1="${x}" y1="${yHigh}" x2="${x}" y2="${yLow}" stroke-width="1" />`
+    );
+    svgParts.push(
+      `<rect class="${up ? "candle-up" : "candle-down"}" x="${x - bodyW / 2}" y="${bodyTop}" width="${bodyW}" height="${bodyH}" />`
+    );
+  });
+
+  // EMA overlays (entry panel only)
+  if (panel.emaFast) {
+    const pts = panel.emaFast.map((v, i) => `${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`);
+    svgParts.push(`<polyline class="ema-fast" points="${pts.join(" ")}" />`);
+  }
+  if (panel.emaSlow) {
+    const pts = panel.emaSlow.map((v, i) => `${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`);
+    svgParts.push(`<polyline class="ema-slow" points="${pts.join(" ")}" />`);
+  }
+
+  // trendline
+  if (panel.trendline) {
+    const { p1, p2 } = panel.trendline;
+    svgParts.push(
+      `<line class="trendline" x1="${xAt(p1.index)}" y1="${yAt(p1.price)}" x2="${xAt(p2.index)}" y2="${yAt(p2.price)}" />`
+    );
+  }
+
+  // signal arrow
+  if (opts.signalIndex !== null && opts.signalIndex !== undefined && opts.signalIndex >= 0) {
+    const c = candles[opts.signalIndex];
+    if (c) {
+      const x = xAt(opts.signalIndex);
+      const isSell = opts.signalType === "SELL";
+      const y = isSell ? yAt(c.h) - 10 : yAt(c.l) + 10;
+      const tip = isSell ? y + 8 : y - 8;
+      const cls = isSell ? "is-sell" : "is-buy";
+      // simple triangle pointing toward the candle
+      const trianglePoints = isSell
+        ? `${x - 5},${y - 6} ${x + 5},${y - 6} ${x},${y + 4}`
+        : `${x - 5},${y + 6} ${x + 5},${y + 6} ${x},${y - 4}`;
+      svgParts.push(`<polygon class="signal-arrow ${cls}" points="${trianglePoints}" />`);
+    }
+  }
+
+  svg.innerHTML = svgParts.join("");
+}
+
 function render(state) {
   const pulse = document.getElementById("pulse");
   const pulseText = document.getElementById("pulse-text");
@@ -95,6 +183,25 @@ function render(state) {
           `<li><span class="history__signal is-${h.signal.toLowerCase()}">${h.signal}</span><span>${fmt(h.price)} · ${timeAgo(h.time)}</span></li>`
       )
       .join("");
+  }
+
+  // signal map
+  const reasonEl = document.getElementById("reason-text");
+  if (state.chartMap) {
+    document.getElementById("context-label").textContent =
+      `${state.chartMap.context.interval} · context`;
+    document.getElementById("entry-label").textContent =
+      `${state.chartMap.entry.interval} · entry`;
+
+    drawChart("chart-context", state.chartMap.context);
+    drawChart("chart-entry", state.chartMap.entry, {
+      signalIndex: state.chartMap.entry.signalIndex,
+      signalType: state.chartMap.entry.signalType,
+    });
+
+    reasonEl.textContent = state.chartMap.reason || "";
+  } else {
+    reasonEl.textContent = "Waiting for first check…";
   }
 }
 
