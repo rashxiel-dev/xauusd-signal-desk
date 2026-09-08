@@ -59,6 +59,21 @@
 
     </main>
 
+    <section class="mapwrap">
+      <div class="panel__label">Signal map</div>
+      <div class="mapgrid">
+        <div class="chartcol">
+          <div class="chartcol__label" id="context-label">H4 &middot; context</div>
+          <svg id="chart-context" class="chart" viewBox="0 0 500 300" preserveAspectRatio="none"></svg>
+        </div>
+        <div class="chartcol">
+          <div class="chartcol__label" id="entry-label">15min &middot; entry</div>
+          <svg id="chart-entry" class="chart" viewBox="0 0 500 300" preserveAspectRatio="none"></svg>
+        </div>
+      </div>
+      <div class="reason" id="reason-text">Waiting for first check&hellip;</div>
+    </section>
+
     <footer class="desk__footer">
       Alerts are pushed to Telegram the moment a crossover confirms &mdash; this page is a window onto that, not the trigger. Signal only, not financial advice.
     </footer>
