@@ -60,6 +60,9 @@ const state = {
   suggestedTP: null,
   lastSignal: null,
   lastSignalTime: null,
+  lastSignalStrategy: null,
+  lastSignalReason: null,
+  strategySignals: { emaCross: null, srBounce: null, breakout: null },
   history: [],
   sparkline: [],
   chartMap: null, // { context: {...}, entry: {...}, reason: "" }
@@ -304,7 +307,13 @@ function buildTrendline(candles, bias) {
   return {
     p1: { index: firstIndex, price: reg.slope * firstIndex + reg.intercept },
     p2: { index: lastIndex, price: reg.slope * lastIndex + reg.intercept },
+    slope: reg.slope,
+    intercept: reg.intercept,
   };
+}
+
+function trendlineValueAt(trendline, index) {
+  return trendline.slope * index + trendline.intercept;
 }
 
 // Overall bias for a candle set: slope of a regression through closes.
@@ -313,6 +322,118 @@ function closesBias(candles) {
   const reg = linearRegression(pts);
   if (!reg) return "flat";
   return reg.slope < 0 ? "down" : "up";
+}
+
+// ---------------- Strategies ----------------
+// Each evaluator looks only at the entry timeframe and returns either
+// null (no setup right now) or { signal, sl, tp, reason }.
+
+function evaluateEmaCross(entryCandles, emaFastArr, emaSlowArr, rsiArr, atrArr, i) {
+  const prevI = i - 1;
+  const price = entryCandles[i].close;
+  const atrVal = atrArr[i];
+  if (!atrVal) return null;
+
+  const crossedUp = emaFastArr[prevI] <= emaSlowArr[prevI] && emaFastArr[i] > emaSlowArr[i];
+  const crossedDown = emaFastArr[prevI] >= emaSlowArr[prevI] && emaFastArr[i] < emaSlowArr[i];
+
+  if (crossedUp && rsiArr[i] < RSI_OVERBOUGHT) {
+    return {
+      signal: "BUY",
+      sl: price - atrVal * 1.5,
+      tp: price + atrVal * 2.5,
+      reason: `EMA${EMA_FAST} crossed above EMA${EMA_SLOW} with RSI at ${rsiArr[i].toFixed(1)} — bullish momentum confirmed.`,
+    };
+  }
+  if (crossedDown && rsiArr[i] > RSI_OVERSOLD) {
+    return {
+      signal: "SELL",
+      sl: price + atrVal * 1.5,
+      tp: price - atrVal * 2.5,
+      reason: `EMA${EMA_FAST} crossed below EMA${EMA_SLOW} with RSI at ${rsiArr[i].toFixed(1)} — bearish momentum confirmed.`,
+    };
+  }
+  return null;
+}
+
+// Rejection off an auto-drawn support or resistance trendline: price
+// wicks through the line but closes back on the "right" side.
+function evaluateSRBounce(entryCandles, atrArr, i, supportLine, resistanceLine) {
+  const c = entryCandles[i];
+  const atrVal = atrArr[i];
+  if (!atrVal) return null;
+  const tolerance = atrVal * 0.6;
+
+  if (supportLine) {
+    const lineVal = trendlineValueAt(supportLine, i);
+    const wickedThrough = c.low <= lineVal + tolerance;
+    const closedAbove = c.close > lineVal;
+    const bullishCandle = c.close > c.open;
+    if (wickedThrough && closedAbove && bullishCandle) {
+      const sl = c.low - atrVal * 0.5;
+      const tp = c.close + (c.close - sl) * 1.5;
+      return {
+        signal: "BUY",
+        sl,
+        tp,
+        reason: `Price wicked into the support trendline near ${lineVal.toFixed(2)} and closed back above it on a bullish candle — rejection bounce.`,
+      };
+    }
+  }
+
+  if (resistanceLine) {
+    const lineVal = trendlineValueAt(resistanceLine, i);
+    const wickedThrough = c.high >= lineVal - tolerance;
+    const closedBelow = c.close < lineVal;
+    const bearishCandle = c.close < c.open;
+    if (wickedThrough && closedBelow && bearishCandle) {
+      const sl = c.high + atrVal * 0.5;
+      const tp = c.close - (sl - c.close) * 1.5;
+      return {
+        signal: "SELL",
+        sl,
+        tp,
+        reason: `Price wicked into the resistance trendline near ${lineVal.toFixed(2)} and closed back below it on a bearish candle — rejection.`,
+      };
+    }
+  }
+
+  return null;
+}
+
+// Close breaks beyond the recent N-candle range with volatility
+// expanding (ATR above its own recent average) — trend continuation.
+function evaluateBreakout(entryCandles, atrArr, i, lookback = 20) {
+  if (i - lookback < 0) return null;
+  const atrVal = atrArr[i];
+  if (!atrVal) return null;
+
+  const priorCandles = entryCandles.slice(i - lookback, i);
+  const highestHigh = Math.max(...priorCandles.map((c) => c.high));
+  const lowestLow = Math.min(...priorCandles.map((c) => c.low));
+
+  const priorATRs = atrArr.slice(i - lookback, i).filter((v) => v !== null);
+  const avgATR = priorATRs.length ? priorATRs.reduce((a, b) => a + b, 0) / priorATRs.length : atrVal;
+  const expanding = atrVal > avgATR * 1.1;
+
+  const c = entryCandles[i];
+  if (c.close > highestHigh && expanding) {
+    return {
+      signal: "BUY",
+      sl: c.close - atrVal * 1.2,
+      tp: c.close + atrVal * 2.2,
+      reason: `Price closed above the ${lookback}-candle high (${highestHigh.toFixed(2)}) with expanding volatility — breakout continuation.`,
+    };
+  }
+  if (c.close < lowestLow && expanding) {
+    return {
+      signal: "SELL",
+      sl: c.close + atrVal * 1.2,
+      tp: c.close - atrVal * 2.2,
+      reason: `Price closed below the ${lookback}-candle low (${lowestLow.toFixed(2)}) with expanding volatility — breakdown continuation.`,
+    };
+  }
+  return null;
 }
 
 // ---------------- Telegram ----------------
@@ -332,15 +453,13 @@ async function sendTelegram(message) {
   }
 }
 
-function formatMessage(signal, price, rsiVal, atrVal, time, lot) {
-  const sl = signal === "BUY" ? price - atrVal * 1.5 : price + atrVal * 1.5;
-  const tp = signal === "BUY" ? price + atrVal * 2.5 : price - atrVal * 2.5;
+function formatMessage(strategyName, signal, price, rsiVal, time, lot, reason, sl, tp) {
   return (
-    `*${signal} SIGNAL — ${SYMBOL}*\n` +
+    `*${signal} SIGNAL — ${SYMBOL}* _(${strategyName})_\n` +
     `Time: ${time}\n` +
     `Price: ${price.toFixed(2)}\n` +
     `RSI(${RSI_PERIOD}): ${rsiVal.toFixed(1)}\n` +
-    `EMA${EMA_FAST}/${EMA_SLOW} crossover on ${INTERVAL}\n` +
+    `${reason}\n` +
     `Suggested SL: ${sl.toFixed(2)}\n` +
     `Suggested TP: ${tp.toFixed(2)}\n` +
     `Suggested lot: ${lot ? lot.toFixed(2) : "—"} (risking $${RISK_PER_TRADE} on a $${ACCOUNT_SIZE} account)\n` +
@@ -348,17 +467,7 @@ function formatMessage(signal, price, rsiVal, atrVal, time, lot) {
   );
 }
 
-function formatReason(signal, price, rsiVal, bias) {
-  if (signal === "SELL") {
-    return `EMA${EMA_FAST} crossed below EMA${EMA_SLOW} with RSI at ${rsiVal.toFixed(
-      1
-    )} — bearish momentum confirmed near the resistance trendline.`;
-  }
-  if (signal === "BUY") {
-    return `EMA${EMA_FAST} crossed above EMA${EMA_SLOW} with RSI at ${rsiVal.toFixed(
-      1
-    )} — bullish momentum confirmed near the support trendline.`;
-  }
+function formatReason(_unused, price, rsiVal, bias) {
   return `No active crossover — price is ${
     bias === "down" ? "testing resistance" : "testing support"
   } near ${price.toFixed(2)}, EMA${EMA_FAST}/${EMA_SLOW} still trending ${
@@ -382,16 +491,6 @@ async function checkOnce() {
   const atrArr = atr(entryCandles, ATR_PERIOD);
 
   const i = closes.length - 1;
-  const prevI = i - 1;
-
-  const crossedUp =
-    emaFastArr[prevI] <= emaSlowArr[prevI] && emaFastArr[i] > emaSlowArr[i];
-  const crossedDown =
-    emaFastArr[prevI] >= emaSlowArr[prevI] && emaFastArr[i] < emaSlowArr[i];
-
-  let signal = null;
-  if (crossedUp && rsiArr[i] < RSI_OVERBOUGHT) signal = "BUY";
-  else if (crossedDown && rsiArr[i] > RSI_OVERSOLD) signal = "SELL";
 
   const price = closes[i];
   const time = entryCandles[i].datetime;
@@ -401,7 +500,6 @@ async function checkOnce() {
   state.emaFast = emaFastArr[i];
   state.emaSlow = emaSlowArr[i];
   state.atr = atrArr[i];
-  state.signal = signal;
   state.lastChecked = new Date().toISOString();
   state.status = "ok";
   state.lastError = null;
@@ -412,66 +510,97 @@ async function checkOnce() {
     await sendTelegram(
       `✅ Signal bot is live — watching *${SYMBOL}* on ${INTERVAL} candles.\n` +
         `Current price: ${price.toFixed(2)} · RSI: ${rsiArr[i].toFixed(1)}\n` +
-        `You'll get a message here the moment an EMA${EMA_FAST}/${EMA_SLOW} crossover confirms.`
+        `Running 3 strategies: EMA Cross, S/R Bounce, Breakout.`
     );
-  }
-
-  if (signal) {
-    const sl =
-      signal === "BUY" ? price - atrArr[i] * 1.5 : price + atrArr[i] * 1.5;
-    const tp =
-      signal === "BUY" ? price + atrArr[i] * 2.5 : price - atrArr[i] * 2.5;
-    state.suggestedSL = sl;
-    state.suggestedTP = tp;
-    state.suggestedLot = computeLotSize(Math.abs(price - sl));
   }
 
   resetDailyIfNeeded();
 
-  // resolve any trade already being watched before considering a new one
+  // resolve any trade already being watched before considering new ones
   resolveOpenTrade(entryCandles);
   evaluateHalt();
 
-  if (signal && signal !== state.lastSignal) {
+  // trendlines used by both the S/R Bounce strategy and the chart map
+  const supportLine = buildTrendline(entryCandles, "up");
+  const resistanceLine = buildTrendline(entryCandles, "down");
+
+  const strategies = [
+    {
+      key: "emaCross",
+      name: "EMA Cross",
+      result: evaluateEmaCross(entryCandles, emaFastArr, emaSlowArr, rsiArr, atrArr, i),
+    },
+    {
+      key: "srBounce",
+      name: "S/R Bounce",
+      result: evaluateSRBounce(entryCandles, atrArr, i, supportLine, resistanceLine),
+    },
+    {
+      key: "breakout",
+      name: "Breakout",
+      result: evaluateBreakout(entryCandles, atrArr, i),
+    },
+  ];
+
+  state.signal = strategies.find((s) => s.result)?.result.signal || null;
+
+  let anyFired = false;
+  for (const strat of strategies) {
+    if (!strat.result) {
+      state.strategySignals[strat.key] = null;
+      continue;
+    }
+
+    const prev = state.strategySignals[strat.key];
+    if (prev && prev.lastSignal === strat.result.signal) continue; // still the same active call
+
+    state.strategySignals[strat.key] = { lastSignal: strat.result.signal, lastTime: time };
+    anyFired = true;
+
+    const { signal, sl, tp, reason } = strat.result;
+    const lot = computeLotSize(Math.abs(price - sl));
+
     state.lastSignal = signal;
     state.lastSignalTime = time;
-    state.history.unshift({ time, signal, price });
+    state.lastSignalStrategy = strat.name;
+    state.lastSignalReason = reason;
+    state.suggestedSL = sl;
+    state.suggestedTP = tp;
+    state.suggestedLot = lot;
+    state.history.unshift({ time, signal, price, strategy: strat.name });
     state.history = state.history.slice(0, 30);
 
     if (state.risk.halted) {
       console.log(
-        `[${new Date().toISOString()}] ${signal} signal suppressed — risk halt active (${state.risk.haltReason})`
+        `[${new Date().toISOString()}] ${strat.name} ${signal} suppressed — risk halt active (${state.risk.haltReason})`
       );
-    } else {
-      const msg = formatMessage(signal, price, rsiArr[i], atrArr[i], time, state.suggestedLot);
-      await sendTelegram(msg);
-      state.risk.tradesToday += 1;
-
-      if (!state.risk.openTrade) {
-        state.risk.openTrade = {
-          signal,
-          entryPrice: price,
-          sl: state.suggestedSL,
-          tp: state.suggestedTP,
-          entryTime: time,
-        };
-      } else {
-        console.log(
-          `[${new Date().toISOString()}] New ${signal} signal fired while a trade is still open — not auto-tracked for P&L`
-        );
-      }
-
-      console.log(`[${new Date().toISOString()}] Sent ${signal} @ ${price}`);
+      continue;
     }
-  } else {
-    console.log(`[${new Date().toISOString()}] No new signal (current: ${signal})`);
+
+    const msg = formatMessage(strat.name, signal, price, rsiArr[i], time, lot, reason, sl, tp);
+    await sendTelegram(msg);
+    state.risk.tradesToday += 1;
+
+    if (!state.risk.openTrade) {
+      state.risk.openTrade = { signal, entryPrice: price, sl, tp, entryTime: time, strategy: strat.name };
+    } else {
+      console.log(
+        `[${new Date().toISOString()}] ${strat.name} ${signal} fired while a trade is still open — not auto-tracked for P&L`
+      );
+    }
+
+    console.log(`[${new Date().toISOString()}] Sent ${strat.name} ${signal} @ ${price}`);
+  }
+
+  if (!anyFired) {
+    console.log(`[${new Date().toISOString()}] No new signal from any strategy`);
   }
 
   // ---- Signal map: entry chart + context chart, each with a trendline ----
   const entryBias = state.lastSignal === "SELL" ? "down" : state.lastSignal === "BUY" ? "up" : closesBias(entryCandles);
   const contextBias = closesBias(contextCandles);
 
-  const entryTrendline = buildTrendline(entryCandles, entryBias);
+  const entryTrendline = entryBias === "down" ? resistanceLine : supportLine;
   const contextTrendline = buildTrendline(contextCandles, contextBias);
 
   let signalIndex = null;
@@ -481,7 +610,10 @@ async function checkOnce() {
   }
 
   state.chartMap = {
-    reason: formatReason(state.lastSignal, price, rsiArr[i], entryBias),
+    reason:
+      state.lastSignal && state.lastSignalReason
+        ? `${state.lastSignalReason} (${state.lastSignalStrategy})`
+        : formatReason(null, price, rsiArr[i], entryBias),
     entry: {
       interval: INTERVAL,
       candles: entryCandles.map((c) => ({ o: c.open, h: c.high, l: c.low, c: c.close, t: c.datetime })),
@@ -575,6 +707,7 @@ app.post("/api/reset-challenge", (req, res) => {
   state.risk.log = [];
   state.risk.openTrade = null;
   state.risk.dayKey = todayKey();
+  state.strategySignals = { emaCross: null, srBounce: null, breakout: null };
   res.json({ ok: true, risk: state.risk });
 });
 
