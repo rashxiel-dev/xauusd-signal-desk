@@ -371,8 +371,20 @@ html, body {
 .riskmeta {
   font-size: 0.78rem;
   color: var(--text-muted);
-  margin-bottom: 1.1rem;
+  margin-bottom: 0.6rem;
 }
+
+.riskopen {
+  font-size: 0.8rem;
+  color: var(--text);
+  background: var(--panel-raised);
+  border: 1px solid var(--line);
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 1rem;
+  line-height: 1.5;
+}
+.riskopen .is-win { color: var(--buy); font-weight: 600; }
+.riskopen .is-loss { color: var(--sell); font-weight: 600; }
 
 .riskactions {
   display: flex;
