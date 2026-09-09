@@ -253,6 +253,8 @@ function formatReason(signal, price, rsiVal, bias) {
 }
 
 // ---------------- Core check ----------------
+let startupMessageSent = false;
+
 async function checkOnce() {
   const [entryCandles, contextCandles] = await Promise.all([
     fetchCandles(INTERVAL, 100),
@@ -290,6 +292,15 @@ async function checkOnce() {
   state.status = "ok";
   state.lastError = null;
   state.sparkline = closes.slice(-40);
+
+  if (!startupMessageSent) {
+    startupMessageSent = true;
+    await sendTelegram(
+      `✅ Signal bot is live — watching *${SYMBOL}* on ${INTERVAL} candles.\n` +
+        `Current price: ${price.toFixed(2)} · RSI: ${rsiArr[i].toFixed(1)}\n` +
+        `You'll get a message here the moment an EMA${EMA_FAST}/${EMA_SLOW} crossover confirms.`
+    );
+  }
 
   if (signal) {
     const sl =
