@@ -32,7 +32,8 @@ const RSI_OVERBOUGHT = 75;
 const RSI_OVERSOLD = 25;
 const SWING_WINDOW = 2; // candles on each side to qualify as a swing point
 
-const POLL_MS = 15 * 60 * 1000; // check every 15 minutes
+const POLL_MS = 15 * 60 * 1000; // full candle + signal check, every 15 minutes
+const LIVE_POLL_MS = 3 * 60 * 1000; // lightweight price-only tick, every 3 minutes
 
 // ---------------- Challenge / risk config ----------------
 const ACCOUNT_SIZE = parseFloat(process.env.ACCOUNT_SIZE || "5000");
@@ -63,6 +64,8 @@ const state = {
   sparkline: [],
   chartMap: null, // { context: {...}, entry: {...}, reason: "" }
   suggestedLot: null,
+  livePrice: null,
+  liveCheckedAt: null,
   risk: {
     accountSize: ACCOUNT_SIZE,
     dailyLossLimit: DAILY_LOSS_LIMIT,
@@ -76,6 +79,7 @@ const state = {
     halted: false,
     haltReason: null,
     log: [], // { time, result, amount }[]
+    openTrade: null, // { signal, entryPrice, sl, tp, entryTime }
   },
 };
 
@@ -113,6 +117,44 @@ function computeLotSize(slDistance) {
   return Math.max(0.01, Math.round(raw * 100) / 100);
 }
 
+// Records a win/loss against the risk tracker (shared by auto-resolution
+// and manual override).
+function applyTradeResult(result, note) {
+  const amount = result === "win" ? RISK_PER_TRADE * (2.5 / 1.5) : -RISK_PER_TRADE;
+  state.risk.dailyPnL += amount;
+  state.risk.totalPnL += amount;
+  state.risk.log.unshift({ time: new Date().toISOString(), result, amount, note });
+  state.risk.log = state.risk.log.slice(0, 50);
+  evaluateHalt();
+  return amount;
+}
+
+// Watches candles after the open trade's entry for the first touch of
+// SL or TP and auto-logs the outcome. If both are touched within the
+// same candle, SL is assumed to have hit first (conservative).
+function resolveOpenTrade(entryCandles) {
+  const open = state.risk.openTrade;
+  if (!open) return;
+
+  const after = entryCandles.filter((c) => c.datetime > open.entryTime);
+  for (const c of after) {
+    const hitSL =
+      open.signal === "BUY" ? c.low <= open.sl : c.high >= open.sl;
+    const hitTP =
+      open.signal === "BUY" ? c.high >= open.tp : c.low <= open.tp;
+
+    if (hitSL || hitTP) {
+      const result = hitSL ? "loss" : "win";
+      applyTradeResult(result, "auto");
+      console.log(
+        `[${new Date().toISOString()}] Auto-resolved ${open.signal} trade as ${result.toUpperCase()} (candle ${c.datetime})`
+      );
+      state.risk.openTrade = null;
+      return;
+    }
+  }
+}
+
 // ---------------- Data ----------------
 async function fetchCandles(interval, n = 100) {
   const url = new URL("https://api.twelvedata.com/time_series");
@@ -134,6 +176,20 @@ async function fetchCandles(interval, n = 100) {
     low: parseFloat(v.low),
     close: parseFloat(v.close),
   }));
+}
+
+// Lightweight current-price poll (no candle recompute) so the ticker
+// visibly moves between the full 15-min structural checks.
+async function fetchQuote() {
+  const url = new URL("https://api.twelvedata.com/price");
+  url.searchParams.set("symbol", SYMBOL);
+  url.searchParams.set("apikey", TWELVE_DATA_API_KEY);
+  const res = await fetch(url);
+  const data = await res.json();
+  if (!data.price) {
+    throw new Error(`Twelve Data quote error: ${JSON.stringify(data)}`);
+  }
+  return parseFloat(data.price);
 }
 
 // ---------------- Indicators ----------------
@@ -371,6 +427,9 @@ async function checkOnce() {
   }
 
   resetDailyIfNeeded();
+
+  // resolve any trade already being watched before considering a new one
+  resolveOpenTrade(entryCandles);
   evaluateHalt();
 
   if (signal && signal !== state.lastSignal) {
@@ -387,6 +446,21 @@ async function checkOnce() {
       const msg = formatMessage(signal, price, rsiArr[i], atrArr[i], time, state.suggestedLot);
       await sendTelegram(msg);
       state.risk.tradesToday += 1;
+
+      if (!state.risk.openTrade) {
+        state.risk.openTrade = {
+          signal,
+          entryPrice: price,
+          sl: state.suggestedSL,
+          tp: state.suggestedTP,
+          entryTime: time,
+        };
+      } else {
+        console.log(
+          `[${new Date().toISOString()}] New ${signal} signal fired while a trade is still open — not auto-tracked for P&L`
+        );
+      }
+
       console.log(`[${new Date().toISOString()}] Sent ${signal} @ ${price}`);
     }
   } else {
@@ -442,6 +516,19 @@ async function pollLoop() {
   }
 }
 
+// Lightweight tick between structural checks so the price/chart feel live.
+async function liveLoop() {
+  try {
+    const price = await fetchQuote();
+    state.livePrice = price;
+    state.liveCheckedAt = new Date().toISOString();
+  } catch (err) {
+    console.error("Live quote failed:", err.message);
+  } finally {
+    setTimeout(liveLoop, LIVE_POLL_MS);
+  }
+}
+
 // ---------------- Web server ----------------
 const app = express();
 app.use(express.json());
@@ -451,7 +538,9 @@ app.get("/api/status", (req, res) => {
   res.json(state);
 });
 
-// Log the outcome of the last-taken trade against the risk tracker.
+// Log the outcome of the currently open trade (manual override — the
+// bot normally resolves this itself against SL/TP). Falls back to a
+// generic log entry if nothing is currently open.
 // body: { result: "win" | "loss" }
 app.post("/api/trade-result", (req, res) => {
   resetDailyIfNeeded();
@@ -460,13 +549,8 @@ app.post("/api/trade-result", (req, res) => {
     return res.status(400).json({ error: "result must be 'win' or 'loss'" });
   }
 
-  // Win pays out at the same reward:risk ratio as the TP/SL suggestion (2.5 : 1.5).
-  const amount = result === "win" ? RISK_PER_TRADE * (2.5 / 1.5) : -RISK_PER_TRADE;
-  state.risk.dailyPnL += amount;
-  state.risk.totalPnL += amount;
-  state.risk.log.unshift({ time: new Date().toISOString(), result, amount });
-  state.risk.log = state.risk.log.slice(0, 50);
-  evaluateHalt();
+  applyTradeResult(result, state.risk.openTrade ? "manual override" : "manual");
+  state.risk.openTrade = null;
 
   res.json({ ok: true, risk: state.risk });
 });
@@ -489,6 +573,7 @@ app.post("/api/reset-challenge", (req, res) => {
   state.risk.halted = false;
   state.risk.haltReason = null;
   state.risk.log = [];
+  state.risk.openTrade = null;
   state.risk.dayKey = todayKey();
   res.json({ ok: true, risk: state.risk });
 });
@@ -510,4 +595,5 @@ app.listen(PORT, () => {
   }
 
   pollLoop();
+  liveLoop();
 });
