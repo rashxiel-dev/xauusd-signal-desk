@@ -308,6 +308,115 @@ html, body {
   line-height: 1.6;
 }
 
+/* ---- risk manager ---- */
+.riskwrap {
+  margin-top: 1px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-top: none;
+  padding: 1.5rem;
+}
+
+.riskbanner {
+  background: rgba(177, 80, 63, 0.12);
+  border: 1px solid var(--sell);
+  color: var(--sell);
+  font-size: 0.82rem;
+  padding: 0.65rem 0.9rem;
+  margin-bottom: 1rem;
+  line-height: 1.5;
+}
+
+.riskgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+@media (max-width: 720px) {
+  .riskgrid { grid-template-columns: 1fr; }
+}
+
+.risklabel {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-bottom: 0.4rem;
+  display: flex;
+  justify-content: space-between;
+}
+
+.riskbar {
+  height: 8px;
+  background: var(--panel-raised);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+
+.riskbar__fill {
+  height: 100%;
+  width: 0%;
+  background: var(--buy);
+  transition: width 0.3s ease;
+}
+
+.riskbar__fill.is-loss { background: var(--sell); }
+
+.riskvalue {
+  margin-top: 0.4rem;
+  font-size: 1rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.riskmeta {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  margin-bottom: 1.1rem;
+}
+
+.riskactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+}
+
+.riskbtn {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  padding: 0.5rem 0.85rem;
+  border: 1px solid var(--line);
+  background: var(--panel-raised);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.riskbtn:hover { border-color: var(--gold-dim); }
+.riskbtn--win { border-color: var(--buy); color: var(--buy); }
+.riskbtn--loss { border-color: var(--sell); color: var(--sell); }
+.riskbtn--ghost { color: var(--text-muted); }
+.riskbtn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.risklog {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.78rem;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.risklog li {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.4rem 0;
+  border-top: 1px solid var(--line);
+  color: var(--text-muted);
+}
+.risklog li:first-child { border-top: none; }
+.risklog .is-win { color: var(--buy); }
+.risklog .is-loss { color: var(--sell); }
+
 /* ---- footer ---- */
 .desk__footer {
   margin-top: 1.75rem;
