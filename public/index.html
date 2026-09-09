@@ -74,6 +74,36 @@
       <div class="reason" id="reason-text">Waiting for first check&hellip;</div>
     </section>
 
+    <section class="riskwrap">
+      <div class="panel__label">Risk manager</div>
+
+      <div class="riskbanner" id="risk-banner" style="display:none;"></div>
+
+      <div class="riskgrid">
+        <div class="riskcol">
+          <div class="risklabel">Daily P&amp;L <span id="risk-daily-limit"></span></div>
+          <div class="riskbar"><div class="riskbar__fill" id="risk-daily-fill"></div></div>
+          <div class="riskvalue" id="risk-daily-value">$0.00</div>
+        </div>
+        <div class="riskcol">
+          <div class="risklabel">Total P&amp;L <span id="risk-total-limit"></span></div>
+          <div class="riskbar"><div class="riskbar__fill" id="risk-total-fill"></div></div>
+          <div class="riskvalue" id="risk-total-value">$0.00</div>
+        </div>
+      </div>
+
+      <div class="riskmeta" id="risk-meta">&mdash;</div>
+
+      <div class="riskactions">
+        <button class="riskbtn riskbtn--win" id="btn-log-win">Log last trade: Win</button>
+        <button class="riskbtn riskbtn--loss" id="btn-log-loss">Log last trade: Loss</button>
+        <button class="riskbtn riskbtn--ghost" id="btn-reset-day">Reset day</button>
+        <button class="riskbtn riskbtn--ghost" id="btn-reset-challenge">Reset challenge</button>
+      </div>
+
+      <ul class="risklog" id="risk-log"></ul>
+    </section>
+
     <footer class="desk__footer">
       Alerts are pushed to Telegram the moment a crossover confirms &mdash; this page is a window onto that, not the trigger. Signal only, not financial advice.
     </footer>
