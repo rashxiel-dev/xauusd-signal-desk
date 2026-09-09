@@ -47,8 +47,22 @@ function drawChart(svgId, panel, opts = {}) {
 
   const W = 500, H = 300;
   const padTop = 14, padBottom = 14, padLeft = 6, padRight = 54;
-  const candles = panel.candles;
-  const n = candles.length;
+  const rawCandles = panel.candles;
+  const n = rawCandles.length;
+
+  // extend the last candle live using the most recent quote, so the
+  // chart visibly moves between full 15-min checks
+  let candles = rawCandles;
+  if (opts.livePrice !== null && opts.livePrice !== undefined && n > 0) {
+    candles = rawCandles.slice();
+    const last = candles[n - 1];
+    candles[n - 1] = {
+      ...last,
+      c: opts.livePrice,
+      h: Math.max(last.h, opts.livePrice),
+      l: Math.min(last.l, opts.livePrice),
+    };
+  }
 
   let min = Math.min(...candles.map((c) => c.l));
   let max = Math.max(...candles.map((c) => c.h));
@@ -168,14 +182,23 @@ function render(state) {
   document.getElementById("pair-line").textContent =
     `${state.symbol || "XAU/USD"} · ${state.interval || "15min"} · EMA 9/21 + RSI`;
 
+  const displayPrice =
+    state.livePrice !== null && state.livePrice !== undefined ? state.livePrice : state.price;
   document.getElementById("price").textContent =
-    state.price !== null ? fmt(state.price) : "—";
+    displayPrice !== null && displayPrice !== undefined ? fmt(displayPrice) : "—";
 
-  document.getElementById("checked-at").textContent = state.lastChecked
+  const checkedText = state.liveCheckedAt
+    ? `live tick ${timeAgo(state.liveCheckedAt)} · full check ${timeAgo(state.lastChecked)}`
+    : state.lastChecked
     ? `checked ${timeAgo(state.lastChecked)}`
     : "waiting for first check…";
+  document.getElementById("checked-at").textContent = checkedText;
 
-  drawSpark(state.sparkline);
+  drawSpark(
+    state.livePrice !== null && state.livePrice !== undefined
+      ? [...(state.sparkline || []), state.livePrice]
+      : state.sparkline
+  );
 
   document.getElementById("rsi-val").textContent = fmt(state.rsi, 1);
   document.getElementById("ema-fast").textContent = fmt(state.emaFast);
@@ -223,6 +246,7 @@ function render(state) {
     drawChart("chart-entry", state.chartMap.entry, {
       signalIndex: state.chartMap.entry.signalIndex,
       signalType: state.chartMap.entry.signalType,
+      livePrice: state.livePrice,
     });
 
     reasonEl.textContent = state.chartMap.reason || "";
@@ -266,6 +290,17 @@ function renderRisk(risk) {
 
   document.getElementById("risk-meta").textContent =
     `$${risk.riskPerTrade} risked per trade on a $${risk.accountSize} account · ${risk.tradesToday} alert(s) sent today`;
+
+  const openEl = document.getElementById("risk-open-trade");
+  if (risk.openTrade) {
+    const o = risk.openTrade;
+    openEl.style.display = "block";
+    openEl.innerHTML =
+      `Watching open <span class="is-${o.signal === "BUY" ? "win" : "loss"}">${o.signal}</span> from ${fmt(o.entryPrice)} — ` +
+      `auto-resolves on SL ${fmt(o.sl)} / TP ${fmt(o.tp)} touch. Use the buttons below only to override.`;
+  } else {
+    openEl.style.display = "none";
+  }
 
   const log = document.getElementById("risk-log");
   if (!risk.log || risk.log.length === 0) {
