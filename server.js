@@ -430,12 +430,15 @@ async function checkOnce() {
 async function pollLoop() {
   try {
     await checkOnce();
+    setTimeout(pollLoop, POLL_MS);
   } catch (err) {
     state.status = "error";
     state.lastError = err.message;
     console.error("Check failed:", err.message);
-  } finally {
-    setTimeout(pollLoop, POLL_MS);
+    // retry sooner than a full cycle so a transient network blip
+    // (common right after a cold start) doesn't leave the dashboard
+    // blank for 15 minutes
+    setTimeout(pollLoop, 60 * 1000);
   }
 }
 
