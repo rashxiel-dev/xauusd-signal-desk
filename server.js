@@ -34,6 +34,14 @@ const SWING_WINDOW = 2; // candles on each side to qualify as a swing point
 
 const POLL_MS = 15 * 60 * 1000; // check every 15 minutes
 
+// ---------------- Challenge / risk config ----------------
+const ACCOUNT_SIZE = parseFloat(process.env.ACCOUNT_SIZE || "5000");
+const DAILY_LOSS_LIMIT = parseFloat(process.env.DAILY_LOSS_LIMIT || "200");
+const MAX_LOSS_LIMIT = parseFloat(process.env.MAX_LOSS_LIMIT || "350");
+const PROFIT_TARGET = parseFloat(process.env.PROFIT_TARGET || "500");
+const RISK_PER_TRADE = parseFloat(process.env.RISK_PER_TRADE || "50");
+const XAU_LOT_USD_PER_POINT = 100; // 1.00 lot XAUUSD ≈ $100 per $1 move (100oz)
+
 // ---------------- In-memory state ----------------
 const state = {
   status: "starting",
@@ -54,7 +62,56 @@ const state = {
   history: [],
   sparkline: [],
   chartMap: null, // { context: {...}, entry: {...}, reason: "" }
+  suggestedLot: null,
+  risk: {
+    accountSize: ACCOUNT_SIZE,
+    dailyLossLimit: DAILY_LOSS_LIMIT,
+    maxLossLimit: MAX_LOSS_LIMIT,
+    profitTarget: PROFIT_TARGET,
+    riskPerTrade: RISK_PER_TRADE,
+    dailyPnL: 0,
+    totalPnL: 0,
+    dayKey: null,
+    tradesToday: 0,
+    halted: false,
+    haltReason: null,
+    log: [], // { time, result, amount }[]
+  },
 };
+
+function todayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function resetDailyIfNeeded() {
+  const key = todayKey();
+  if (state.risk.dayKey !== key) {
+    state.risk.dayKey = key;
+    state.risk.dailyPnL = 0;
+    state.risk.tradesToday = 0;
+    if (state.risk.haltReason === "daily") {
+      state.risk.halted = false;
+      state.risk.haltReason = null;
+    }
+  }
+}
+
+function evaluateHalt() {
+  if (state.risk.totalPnL <= -MAX_LOSS_LIMIT) {
+    state.risk.halted = true;
+    state.risk.haltReason = "max";
+  } else if (state.risk.dailyPnL <= -DAILY_LOSS_LIMIT) {
+    state.risk.halted = true;
+    state.risk.haltReason = "daily";
+  }
+}
+
+// lot size sized so a full stop-out costs exactly RISK_PER_TRADE
+function computeLotSize(slDistance) {
+  if (!slDistance || slDistance <= 0) return null;
+  const raw = RISK_PER_TRADE / (slDistance * XAU_LOT_USD_PER_POINT);
+  return Math.max(0.01, Math.round(raw * 100) / 100);
+}
 
 // ---------------- Data ----------------
 async function fetchCandles(interval, n = 100) {
@@ -219,7 +276,7 @@ async function sendTelegram(message) {
   }
 }
 
-function formatMessage(signal, price, rsiVal, atrVal, time) {
+function formatMessage(signal, price, rsiVal, atrVal, time, lot) {
   const sl = signal === "BUY" ? price - atrVal * 1.5 : price + atrVal * 1.5;
   const tp = signal === "BUY" ? price + atrVal * 2.5 : price - atrVal * 2.5;
   return (
@@ -230,6 +287,7 @@ function formatMessage(signal, price, rsiVal, atrVal, time) {
     `EMA${EMA_FAST}/${EMA_SLOW} crossover on ${INTERVAL}\n` +
     `Suggested SL: ${sl.toFixed(2)}\n` +
     `Suggested TP: ${tp.toFixed(2)}\n` +
+    `Suggested lot: ${lot ? lot.toFixed(2) : "—"} (risking $${RISK_PER_TRADE} on a $${ACCOUNT_SIZE} account)\n` +
     `_Signal only — not financial advice. Confirm before trading._`
   );
 }
@@ -309,16 +367,28 @@ async function checkOnce() {
       signal === "BUY" ? price + atrArr[i] * 2.5 : price - atrArr[i] * 2.5;
     state.suggestedSL = sl;
     state.suggestedTP = tp;
+    state.suggestedLot = computeLotSize(Math.abs(price - sl));
   }
 
+  resetDailyIfNeeded();
+  evaluateHalt();
+
   if (signal && signal !== state.lastSignal) {
-    const msg = formatMessage(signal, price, rsiArr[i], atrArr[i], time);
-    await sendTelegram(msg);
     state.lastSignal = signal;
     state.lastSignalTime = time;
     state.history.unshift({ time, signal, price });
     state.history = state.history.slice(0, 30);
-    console.log(`[${new Date().toISOString()}] Sent ${signal} @ ${price}`);
+
+    if (state.risk.halted) {
+      console.log(
+        `[${new Date().toISOString()}] ${signal} signal suppressed — risk halt active (${state.risk.haltReason})`
+      );
+    } else {
+      const msg = formatMessage(signal, price, rsiArr[i], atrArr[i], time, state.suggestedLot);
+      await sendTelegram(msg);
+      state.risk.tradesToday += 1;
+      console.log(`[${new Date().toISOString()}] Sent ${signal} @ ${price}`);
+    }
   } else {
     console.log(`[${new Date().toISOString()}] No new signal (current: ${signal})`);
   }
@@ -371,10 +441,53 @@ async function pollLoop() {
 
 // ---------------- Web server ----------------
 const app = express();
+app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
 app.get("/api/status", (req, res) => {
   res.json(state);
+});
+
+// Log the outcome of the last-taken trade against the risk tracker.
+// body: { result: "win" | "loss" }
+app.post("/api/trade-result", (req, res) => {
+  resetDailyIfNeeded();
+  const { result } = req.body || {};
+  if (result !== "win" && result !== "loss") {
+    return res.status(400).json({ error: "result must be 'win' or 'loss'" });
+  }
+
+  // Win pays out at the same reward:risk ratio as the TP/SL suggestion (2.5 : 1.5).
+  const amount = result === "win" ? RISK_PER_TRADE * (2.5 / 1.5) : -RISK_PER_TRADE;
+  state.risk.dailyPnL += amount;
+  state.risk.totalPnL += amount;
+  state.risk.log.unshift({ time: new Date().toISOString(), result, amount });
+  state.risk.log = state.risk.log.slice(0, 50);
+  evaluateHalt();
+
+  res.json({ ok: true, risk: state.risk });
+});
+
+app.post("/api/reset-day", (req, res) => {
+  state.risk.dailyPnL = 0;
+  state.risk.tradesToday = 0;
+  state.risk.dayKey = todayKey();
+  if (state.risk.haltReason === "daily") {
+    state.risk.halted = false;
+    state.risk.haltReason = null;
+  }
+  res.json({ ok: true, risk: state.risk });
+});
+
+app.post("/api/reset-challenge", (req, res) => {
+  state.risk.dailyPnL = 0;
+  state.risk.totalPnL = 0;
+  state.risk.tradesToday = 0;
+  state.risk.halted = false;
+  state.risk.haltReason = null;
+  state.risk.log = [];
+  state.risk.dayKey = todayKey();
+  res.json({ ok: true, risk: state.risk });
 });
 
 app.listen(PORT, () => {
