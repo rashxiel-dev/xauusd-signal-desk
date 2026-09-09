@@ -244,6 +244,18 @@ html, body {
   justify-content: flex-start !important;
 }
 
+/* ---- live chart (TradingView embed) ---- */
+.livewrap {
+  margin-top: 1px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  padding: 1.5rem;
+}
+
+.tradingview-widget-container {
+  border: 1px solid var(--line);
+}
+
 /* ---- signal map ---- */
 .mapwrap {
   margin-top: 1px;
