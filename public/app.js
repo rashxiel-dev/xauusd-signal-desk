@@ -46,7 +46,7 @@ function drawChart(svgId, panel, opts = {}) {
   }
 
   const W = 500, H = 300;
-  const padTop = 14, padBottom = 14, padLeft = 6, padRight = 6;
+  const padTop = 14, padBottom = 14, padLeft = 6, padRight = 54;
   const candles = panel.candles;
   const n = candles.length;
 
@@ -67,6 +67,21 @@ function drawChart(svgId, panel, opts = {}) {
   const yAt = (price) => padTop + plotH - ((price - min) / range) * plotH;
 
   let svgParts = [];
+
+  // price axis gridlines (drawn first so candles sit on top)
+  const mid = (min + max) / 2;
+  [
+    { price: max, y: padTop },
+    { price: mid, y: padTop + plotH / 2 },
+    { price: min, y: padTop + plotH },
+  ].forEach(({ price, y }) => {
+    svgParts.push(
+      `<line x1="${padLeft}" y1="${y}" x2="${W - padRight}" y2="${y}" stroke="#2a2c22" stroke-width="0.75" />`
+    );
+    svgParts.push(
+      `<text x="${W - padRight - 4}" y="${y - 3}" text-anchor="end" font-size="9" fill="#8b8a78" font-family="IBM Plex Mono, monospace">${price.toFixed(2)}</text>`
+    );
+  });
 
   // candles
   candles.forEach((c, i) => {
@@ -121,6 +136,16 @@ function drawChart(svgId, panel, opts = {}) {
       svgParts.push(`<polygon class="signal-arrow ${cls}" points="${trianglePoints}" />`);
     }
   }
+
+  // last price marker — dashed line + gold label at the current close
+  const lastClose = candles[candles.length - 1].c;
+  const yLast = yAt(lastClose);
+  svgParts.push(
+    `<line x1="${padLeft}" y1="${yLast}" x2="${W - padRight}" y2="${yLast}" stroke="#c9a227" stroke-width="0.75" stroke-dasharray="3 2" opacity="0.6" />`
+  );
+  svgParts.push(
+    `<text x="${W - padRight + 4}" y="${yLast + 3}" font-size="9" fill="#c9a227" font-family="IBM Plex Mono, monospace" font-weight="600">${lastClose.toFixed(2)}</text>`
+  );
 
   svg.innerHTML = svgParts.join("");
 }
