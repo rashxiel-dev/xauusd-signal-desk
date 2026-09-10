@@ -5,6 +5,17 @@ function fmt(n, digits = 2) {
   return Number(n).toFixed(digits);
 }
 
+function formatDateTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return d.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function timeAgo(iso) {
   if (!iso) return "";
   const diff = Math.max(0, Date.now() - new Date(iso).getTime());
@@ -214,10 +225,11 @@ function render(state) {
 
   if (activeSignal && state.suggestedSL && state.suggestedTP) {
     sigTargets.innerHTML =
+      `Entry zone <span>${fmt(state.lastSignalPrice)}</span><br>` +
       `Stop loss <span>${fmt(state.suggestedSL)}</span><br>` +
       `Take profit <span>${fmt(state.suggestedTP)}</span><br>` +
       `Suggested lot <span>${state.suggestedLot ? state.suggestedLot.toFixed(2) : "—"}</span><br>` +
-      `Fired ${timeAgo(state.lastSignalTime)}`;
+      `Fired <span>${formatDateTime(state.lastSignalTime)}</span> (${timeAgo(state.lastSignalTime)})`;
   } else {
     sigTargets.textContent = "No active crossover — watching for the next one.";
   }
@@ -229,7 +241,7 @@ function render(state) {
     list.innerHTML = state.history
       .map(
         (h) =>
-          `<li><span class="history__signal is-${h.signal.toLowerCase()}">${h.signal}</span><span>${fmt(h.price)} · ${timeAgo(h.time)}</span></li>`
+          `<li><span class="history__signal is-${h.signal.toLowerCase()}">${h.signal}${h.strategy ? ` · ${h.strategy}` : ""}</span><span>${fmt(h.price)} · ${formatDateTime(h.time)}</span></li>`
       )
       .join("");
   }
