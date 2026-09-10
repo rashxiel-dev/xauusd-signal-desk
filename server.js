@@ -60,6 +60,7 @@ const state = {
   suggestedTP: null,
   lastSignal: null,
   lastSignalTime: null,
+  lastSignalPrice: null,
   lastSignalStrategy: null,
   lastSignalReason: null,
   strategySignals: { emaCross: null, srBounce: null, breakout: null },
@@ -562,6 +563,7 @@ async function checkOnce() {
 
     state.lastSignal = signal;
     state.lastSignalTime = time;
+    state.lastSignalPrice = price;
     state.lastSignalStrategy = strat.name;
     state.lastSignalReason = reason;
     state.suggestedSL = sl;
