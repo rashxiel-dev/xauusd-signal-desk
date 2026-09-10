@@ -167,6 +167,7 @@ async function fetchCandles(interval, n = 100) {
   url.searchParams.set("outputsize", n);
   url.searchParams.set("apikey", TWELVE_DATA_API_KEY);
   url.searchParams.set("order", "ASC");
+  url.searchParams.set("timezone", "UTC");
 
   const res = await fetch(url);
   const data = await res.json();
