@@ -5,9 +5,18 @@ function fmt(n, digits = 2) {
   return Number(n).toFixed(digits);
 }
 
+// Twelve Data returns candle times as "YYYY-MM-DD HH:mm:ss" with no
+// timezone marker; the server explicitly requests these in UTC, so we
+// mark them as UTC here before parsing, or the browser guesses.
+function asUTCDate(raw) {
+  if (!raw) return null;
+  const iso = raw.includes("T") ? raw : raw.replace(" ", "T");
+  return new Date(iso.endsWith("Z") ? iso : iso + "Z");
+}
+
 function formatDateTime(iso) {
   if (!iso) return "";
-  const d = new Date(iso);
+  const d = asUTCDate(iso);
   return d.toLocaleString(undefined, {
     month: "short",
     day: "numeric",
@@ -18,7 +27,7 @@ function formatDateTime(iso) {
 
 function timeAgo(iso) {
   if (!iso) return "";
-  const diff = Math.max(0, Date.now() - new Date(iso).getTime());
+  const diff = Math.max(0, Date.now() - asUTCDate(iso).getTime());
   const mins = Math.floor(diff / 60000);
   if (mins < 1) return "just now";
   if (mins === 1) return "1 min ago";
