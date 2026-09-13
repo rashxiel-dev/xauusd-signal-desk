@@ -191,6 +191,9 @@ function render(state) {
   if (state.status === "ok") {
     pulse.className = "desk__pulse is-live";
     pulseText.textContent = "live";
+  } else if (state.status === "closed") {
+    pulse.className = "desk__pulse";
+    pulseText.textContent = "market closed";
   } else if (state.status === "error") {
     pulse.className = "desk__pulse is-down";
     pulseText.textContent = state.lastError || "error";
