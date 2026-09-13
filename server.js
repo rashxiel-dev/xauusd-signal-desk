@@ -382,44 +382,52 @@ function evaluateEmaCross(entryCandles, emaFastArr, emaSlowArr, rsiArr, atrArr, 
   return null;
 }
 
-// Rejection off an auto-drawn support or resistance trendline: price
-// wicks through the line but closes back on the "right" side.
+// Rejection off an auto-drawn support or resistance trendline. Requires
+// two candles: the wick-and-close rejection, THEN a follow-through
+// candle that closes further in the rejection direction — filters out
+// single-candle noise that immediately reverses.
 function evaluateSRBounce(entryCandles, atrArr, i, supportLine, resistanceLine) {
-  const c = entryCandles[i];
+  if (i - 1 < 0) return null;
+  const rejection = entryCandles[i - 1];
+  const confirm = entryCandles[i];
   const atrVal = atrArr[i];
   if (!atrVal) return null;
   const tolerance = atrVal * 0.6;
 
   if (supportLine) {
-    const lineVal = trendlineValueAt(supportLine, i);
-    const wickedThrough = c.low <= lineVal + tolerance;
-    const closedAbove = c.close > lineVal;
-    const bullishCandle = c.close > c.open;
-    if (wickedThrough && closedAbove && bullishCandle) {
-      const sl = c.low - atrVal * 0.5;
-      const tp = c.close + (c.close - sl) * 1.5;
+    const lineVal = trendlineValueAt(supportLine, i - 1);
+    const wickedThrough = rejection.low <= lineVal + tolerance;
+    const closedAbove = rejection.close > lineVal;
+    const bullishRejection = rejection.close > rejection.open;
+    const followsThrough = confirm.close > rejection.close;
+
+    if (wickedThrough && closedAbove && bullishRejection && followsThrough) {
+      const sl = rejection.low - atrVal * 0.5;
+      const tp = confirm.close + (confirm.close - sl) * 1.5;
       return {
         signal: "BUY",
         sl,
         tp,
-        reason: `Price wicked into the support trendline near ${lineVal.toFixed(2)} and closed back above it on a bullish candle — rejection bounce.`,
+        reason: `Price wicked into the support trendline near ${lineVal.toFixed(2)}, closed back above it, and the next candle followed through higher — confirmed rejection bounce.`,
       };
     }
   }
 
   if (resistanceLine) {
-    const lineVal = trendlineValueAt(resistanceLine, i);
-    const wickedThrough = c.high >= lineVal - tolerance;
-    const closedBelow = c.close < lineVal;
-    const bearishCandle = c.close < c.open;
-    if (wickedThrough && closedBelow && bearishCandle) {
-      const sl = c.high + atrVal * 0.5;
-      const tp = c.close - (sl - c.close) * 1.5;
+    const lineVal = trendlineValueAt(resistanceLine, i - 1);
+    const wickedThrough = rejection.high >= lineVal - tolerance;
+    const closedBelow = rejection.close < lineVal;
+    const bearishRejection = rejection.close < rejection.open;
+    const followsThrough = confirm.close < rejection.close;
+
+    if (wickedThrough && closedBelow && bearishRejection && followsThrough) {
+      const sl = rejection.high + atrVal * 0.5;
+      const tp = confirm.close - (sl - confirm.close) * 1.5;
       return {
         signal: "SELL",
         sl,
         tp,
-        reason: `Price wicked into the resistance trendline near ${lineVal.toFixed(2)} and closed back below it on a bearish candle — rejection.`,
+        reason: `Price wicked into the resistance trendline near ${lineVal.toFixed(2)}, closed back below it, and the next candle followed through lower — confirmed rejection.`,
       };
     }
   }
@@ -427,9 +435,10 @@ function evaluateSRBounce(entryCandles, atrArr, i, supportLine, resistanceLine) 
   return null;
 }
 
-// Close breaks beyond the recent N-candle range with volatility
-// expanding (ATR above its own recent average) — trend continuation.
-function evaluateBreakout(entryCandles, atrArr, i, lookback = 20) {
+// Close breaks beyond the recent N-candle range with volatility clearly
+// expanding (well above its own recent average) — trend continuation.
+// Longer lookback + higher expansion bar = fewer, more meaningful breaks.
+function evaluateBreakout(entryCandles, atrArr, i, lookback = 40) {
   if (i - lookback < 0) return null;
   const atrVal = atrArr[i];
   if (!atrVal) return null;
@@ -440,7 +449,7 @@ function evaluateBreakout(entryCandles, atrArr, i, lookback = 20) {
 
   const priorATRs = atrArr.slice(i - lookback, i).filter((v) => v !== null);
   const avgATR = priorATRs.length ? priorATRs.reduce((a, b) => a + b, 0) / priorATRs.length : atrVal;
-  const expanding = atrVal > avgATR * 1.1;
+  const expanding = atrVal > avgATR * 1.4;
 
   const c = entryCandles[i];
   if (c.close > highestHigh && expanding) {
@@ -448,7 +457,7 @@ function evaluateBreakout(entryCandles, atrArr, i, lookback = 20) {
       signal: "BUY",
       sl: c.close - atrVal * 1.2,
       tp: c.close + atrVal * 2.2,
-      reason: `Price closed above the ${lookback}-candle high (${highestHigh.toFixed(2)}) with expanding volatility — breakout continuation.`,
+      reason: `Price closed above the ${lookback}-candle high (${highestHigh.toFixed(2)}) with volatility well above average — breakout continuation.`,
     };
   }
   if (c.close < lowestLow && expanding) {
@@ -456,7 +465,7 @@ function evaluateBreakout(entryCandles, atrArr, i, lookback = 20) {
       signal: "SELL",
       sl: c.close + atrVal * 1.2,
       tp: c.close - atrVal * 2.2,
-      reason: `Price closed below the ${lookback}-candle low (${lowestLow.toFixed(2)}) with expanding volatility — breakdown continuation.`,
+      reason: `Price closed below the ${lookback}-candle low (${lowestLow.toFixed(2)}) with volatility well above average — breakdown continuation.`,
     };
   }
   return null;
