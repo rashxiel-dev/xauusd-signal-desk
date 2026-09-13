@@ -43,6 +43,30 @@ const PROFIT_TARGET = parseFloat(process.env.PROFIT_TARGET || "500");
 const RISK_PER_TRADE = parseFloat(process.env.RISK_PER_TRADE || "50");
 const XAU_LOT_USD_PER_POINT = 100; // 1.00 lot XAUUSD ≈ $100 per $1 move (100oz)
 
+// Extra single-day closures beyond the standard weekend (e.g. Christmas,
+// New Year's Day) — comma-separated "YYYY-MM-DD" dates, UTC.
+const HOLIDAY_DATES = (process.env.HOLIDAY_DATES || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// Gold/FX conventionally trades ~23/6, closing Friday ~22:00 UTC and
+// reopening Sunday ~22:00 UTC. This is a heuristic, not a broker feed —
+// some brokers open a little earlier/later.
+function isMarketClosed(now = new Date()) {
+  const day = now.getUTCDay(); // 0 = Sun, 6 = Sat
+  const hour = now.getUTCHours();
+
+  if (day === 6) return true; // Saturday: fully closed
+  if (day === 0 && hour < 22) return true; // Sunday before ~22:00 UTC
+  if (day === 5 && hour >= 22) return true; // Friday after ~22:00 UTC
+
+  const todayStr = now.toISOString().slice(0, 10);
+  if (HOLIDAY_DATES.includes(todayStr)) return true;
+
+  return false;
+}
+
 // ---------------- In-memory state ----------------
 const state = {
   status: "starting",
@@ -481,6 +505,13 @@ function formatReason(_unused, price, rsiVal, bias) {
 let startupMessageSent = false;
 
 async function checkOnce() {
+  if (isMarketClosed()) {
+    state.status = "closed";
+    state.lastError = null;
+    console.log(`[${new Date().toISOString()}] Market closed — skipping check`);
+    return;
+  }
+
   const [entryCandles, contextCandles] = await Promise.all([
     fetchCandles(INTERVAL, 100),
     fetchCandles(HIGH_INTERVAL, 80),
@@ -654,9 +685,11 @@ async function pollLoop() {
 // Lightweight tick between structural checks so the price/chart feel live.
 async function liveLoop() {
   try {
-    const price = await fetchQuote();
-    state.livePrice = price;
-    state.liveCheckedAt = new Date().toISOString();
+    if (!isMarketClosed()) {
+      const price = await fetchQuote();
+      state.livePrice = price;
+      state.liveCheckedAt = new Date().toISOString();
+    }
   } catch (err) {
     console.error("Live quote failed:", err.message);
   } finally {
