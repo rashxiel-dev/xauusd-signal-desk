@@ -202,8 +202,11 @@ function render(state) {
     pulseText.textContent = "starting";
   }
 
+  const biasLabel = state.htfBias
+    ? ` · H4 trend ${state.htfBias === "up" ? "▲ up" : "▼ down"}`
+    : "";
   document.getElementById("pair-line").textContent =
-    `${state.symbol || "XAU/USD"} · ${state.interval || "15min"} · EMA 9/21 + RSI`;
+    `${state.symbol || "XAU/USD"} · ${state.interval || "15min"} · EMA 9/21 + RSI${biasLabel}`;
 
   const displayPrice =
     state.livePrice !== null && state.livePrice !== undefined ? state.livePrice : state.price;
