@@ -31,6 +31,8 @@ const ATR_PERIOD = 14;
 const RSI_OVERBOUGHT = 75;
 const RSI_OVERSOLD = 25;
 const SWING_WINDOW = 2; // candles on each side to qualify as a swing point
+const REQUIRE_TREND_ALIGNMENT = process.env.REQUIRE_TREND_ALIGNMENT !== "false";
+const COOLDOWN_MINUTES = parseInt(process.env.COOLDOWN_MINUTES || "120", 10);
 
 const POLL_MS = 15 * 60 * 1000; // full candle + signal check, every 15 minutes
 const LIVE_POLL_MS = 3 * 60 * 1000; // lightweight price-only tick, every 3 minutes
@@ -65,6 +67,24 @@ function isMarketClosed(now = new Date()) {
   if (HOLIDAY_DATES.includes(todayStr)) return true;
 
   return false;
+}
+
+// Steps forward in 5-minute increments to find when the open/closed
+// status next flips — works for the weekend rule AND any date listed
+// in HOLIDAY_DATES, without needing separate math for each case.
+function findNextMarketTransition(now = new Date()) {
+  const currentlyClosed = isMarketClosed(now);
+  const stepMs = 5 * 60 * 1000;
+  const maxSteps = (8 * 24 * 60) / 5; // scan up to 8 days ahead
+  let t = now;
+
+  for (let s = 0; s < maxSteps; s++) {
+    t = new Date(t.getTime() + stepMs);
+    if (isMarketClosed(t) !== currentlyClosed) {
+      return { changesAt: t.toISOString(), willBe: currentlyClosed ? "open" : "closed" };
+    }
+  }
+  return null;
 }
 
 // ---------------- In-memory state ----------------
@@ -566,6 +586,9 @@ async function checkOnce() {
   const supportLine = buildTrendline(entryCandles, "up");
   const resistanceLine = buildTrendline(entryCandles, "down");
 
+  // Higher-timeframe bias — signals must agree with it (trend filter).
+  const htfBias = closesBias(contextCandles);
+
   const strategies = [
     {
       key: "emaCross",
@@ -586,20 +609,45 @@ async function checkOnce() {
 
   state.signal = strategies.find((s) => s.result)?.result.signal || null;
 
+  const nowMs = Date.now();
   let anyFired = false;
+
   for (const strat of strategies) {
-    if (!strat.result) {
-      state.strategySignals[strat.key] = null;
-      continue;
-    }
-
-    const prev = state.strategySignals[strat.key];
-    if (prev && prev.lastSignal === strat.result.signal) continue; // still the same active call
-
-    state.strategySignals[strat.key] = { lastSignal: strat.result.signal, lastTime: time };
-    anyFired = true;
+    if (!strat.result) continue; // no setup; leave cooldown memory intact
 
     const { signal, sl, tp, reason } = strat.result;
+
+    // --- Filter 1: higher-timeframe trend alignment ---
+    if (REQUIRE_TREND_ALIGNMENT) {
+      const aligned =
+        (signal === "BUY" && htfBias === "up") || (signal === "SELL" && htfBias === "down");
+      if (!aligned) {
+        console.log(
+          `[${new Date().toISOString()}] ${strat.name} ${signal} skipped — against ${HIGH_INTERVAL} trend (${htfBias})`
+        );
+        continue;
+      }
+    }
+
+    // --- Filter 2: per-strategy cooldown on the same direction ---
+    const prev = state.strategySignals[strat.key];
+    if (prev && prev.lastSignal === signal) {
+      const elapsedMin = (nowMs - new Date(prev.firedAtMs || 0).getTime()) / 60000;
+      if (elapsedMin < COOLDOWN_MINUTES) {
+        console.log(
+          `[${new Date().toISOString()}] ${strat.name} ${signal} skipped — cooldown (${Math.round(elapsedMin)}/${COOLDOWN_MINUTES} min)`
+        );
+        continue;
+      }
+    }
+
+    state.strategySignals[strat.key] = {
+      lastSignal: signal,
+      lastTime: time,
+      firedAtMs: new Date(nowMs).toISOString(),
+    };
+    anyFired = true;
+
     const lot = computeLotSize(Math.abs(price - sl));
 
     state.lastSignal = signal;
@@ -652,6 +700,7 @@ async function checkOnce() {
     if (idx >= 0) signalIndex = idx;
   }
 
+  state.htfBias = htfBias;
   state.chartMap = {
     reason:
       state.lastSignal && state.lastSignalReason
@@ -712,7 +761,7 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
 app.get("/api/status", (req, res) => {
-  res.json(state);
+  res.json({ ...state, marketTransition: findNextMarketTransition() });
 });
 
 // Log the outcome of the currently open trade (manual override — the
