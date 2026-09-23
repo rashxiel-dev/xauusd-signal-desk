@@ -32,7 +32,7 @@ const RSI_OVERBOUGHT = 75;
 const RSI_OVERSOLD = 25;
 const SWING_WINDOW = 2; // candles on each side to qualify as a swing point
 const REQUIRE_TREND_ALIGNMENT = process.env.REQUIRE_TREND_ALIGNMENT !== "false";
-const COOLDOWN_MINUTES = parseInt(process.env.COOLDOWN_MINUTES || "120", 10);
+const COOLDOWN_MINUTES = parseInt(process.env.COOLDOWN_MINUTES || "30", 10);
 
 const POLL_MS = 15 * 60 * 1000; // full candle + signal check, every 15 minutes
 const LIVE_POLL_MS = 3 * 60 * 1000; // lightweight price-only tick, every 3 minutes
@@ -107,7 +107,8 @@ const state = {
   lastSignalPrice: null,
   lastSignalStrategy: null,
   lastSignalReason: null,
-  strategySignals: { emaCross: null, srBounce: null, breakout: null },
+  strategySignals: { emaCross: null, pullback: null, srBounce: null, breakout: null, rsiReversal: null },
+  regime: null,
   history: [],
   sparkline: [],
   chartMap: null, // { context: {...}, entry: {...}, reason: "" }
@@ -370,9 +371,41 @@ function closesBias(candles) {
   return reg.slope < 0 ? "down" : "up";
 }
 
+// Classifies the market into one of 3 regimes (per the "know the
+// environment" framework: same setup, different odds depending on
+// regime): trending-up, trending-down, or ranging — plus a separate
+// volatility-expansion flag. Trend-following strategies should only
+// fire with a matching trend regime; mean-reversion strategies should
+// only fire while ranging.
+function classifyRegime(candles, emaSlowArr, atrArr, i, lookback = 30) {
+  const start = Math.max(0, i - lookback);
+  const slice = candles.slice(start, i + 1);
+  const emaSlice = emaSlowArr.slice(start, i + 1);
+
+  let aboveCount = 0;
+  for (let k = 0; k < slice.length; k++) {
+    if (slice[k].close > emaSlice[k]) aboveCount++;
+  }
+  const aboveRatio = aboveCount / slice.length;
+  const bias = closesBias(slice);
+
+  let trend;
+  if (bias === "up" && aboveRatio >= 0.65) trend = "trending-up";
+  else if (bias === "down" && aboveRatio <= 0.35) trend = "trending-down";
+  else trend = "ranging";
+
+  const priorATRs = atrArr.slice(start, i).filter((v) => v !== null);
+  const avgATR = priorATRs.length ? priorATRs.reduce((a, b) => a + b, 0) / priorATRs.length : atrArr[i];
+  const volatilityExpansion = atrArr[i] !== null && avgATR ? atrArr[i] > avgATR * 1.3 : false;
+
+  return { trend, volatilityExpansion };
+}
+
 // ---------------- Strategies ----------------
 // Each evaluator looks only at the entry timeframe and returns either
-// null (no setup right now) or { signal, sl, tp, reason }.
+// null (no setup right now) or { signal, sl, tp, reason }. Every
+// strategy targets a 2:1 reward:risk minimum per the entry/stop/target
+// framework (risk ATR*1.0, target ATR*2.0, scaled per strategy).
 
 function evaluateEmaCross(entryCandles, emaFastArr, emaSlowArr, rsiArr, atrArr, i) {
   const prevI = i - 1;
@@ -387,7 +420,7 @@ function evaluateEmaCross(entryCandles, emaFastArr, emaSlowArr, rsiArr, atrArr, 
     return {
       signal: "BUY",
       sl: price - atrVal * 1.5,
-      tp: price + atrVal * 2.5,
+      tp: price + atrVal * 3.0,
       reason: `EMA${EMA_FAST} crossed above EMA${EMA_SLOW} with RSI at ${rsiArr[i].toFixed(1)} — bullish momentum confirmed.`,
     };
   }
@@ -395,9 +428,52 @@ function evaluateEmaCross(entryCandles, emaFastArr, emaSlowArr, rsiArr, atrArr, 
     return {
       signal: "SELL",
       sl: price + atrVal * 1.5,
-      tp: price - atrVal * 2.5,
+      tp: price - atrVal * 3.0,
       reason: `EMA${EMA_FAST} crossed below EMA${EMA_SLOW} with RSI at ${rsiArr[i].toFixed(1)} — bearish momentum confirmed.`,
     };
+  }
+  return null;
+}
+
+// Price pulls back to the EMA21 ("the 20 EMA") inside an established
+// trend and closes back in the trend's direction — the classic
+// pullback-entry setup, only valid while the regime is actually trending.
+function evaluatePullback(entryCandles, emaSlowArr, atrArr, i, regime) {
+  const c = entryCandles[i];
+  const atrVal = atrArr[i];
+  if (!atrVal) return null;
+  const emaMid = emaSlowArr[i];
+  const tolerance = atrVal * 0.5;
+
+  if (regime.trend === "trending-up") {
+    const touchedEma = c.low <= emaMid + tolerance && c.low >= emaMid - tolerance * 1.5;
+    const closedAboveEma = c.close > emaMid;
+    const bullishClose = c.close > c.open;
+    if (touchedEma && closedAboveEma && bullishClose) {
+      const sl = c.low - atrVal * 0.5;
+      const tp = c.close + (c.close - sl) * 2.0;
+      return {
+        signal: "BUY",
+        sl,
+        tp,
+        reason: `Price pulled back to EMA${EMA_SLOW} near ${emaMid.toFixed(2)} in an uptrend and closed bullish — trend pullback entry.`,
+      };
+    }
+  }
+  if (regime.trend === "trending-down") {
+    const touchedEma = c.high >= emaMid - tolerance && c.high <= emaMid + tolerance * 1.5;
+    const closedBelowEma = c.close < emaMid;
+    const bearishClose = c.close < c.open;
+    if (touchedEma && closedBelowEma && bearishClose) {
+      const sl = c.high + atrVal * 0.5;
+      const tp = c.close - (sl - c.close) * 2.0;
+      return {
+        signal: "SELL",
+        sl,
+        tp,
+        reason: `Price pulled back to EMA${EMA_SLOW} near ${emaMid.toFixed(2)} in a downtrend and closed bearish — trend pullback entry.`,
+      };
+    }
   }
   return null;
 }
@@ -423,7 +499,7 @@ function evaluateSRBounce(entryCandles, atrArr, i, supportLine, resistanceLine) 
 
     if (wickedThrough && closedAbove && bullishRejection && followsThrough) {
       const sl = rejection.low - atrVal * 0.5;
-      const tp = confirm.close + (confirm.close - sl) * 1.5;
+      const tp = confirm.close + (confirm.close - sl) * 2.0;
       return {
         signal: "BUY",
         sl,
@@ -442,7 +518,7 @@ function evaluateSRBounce(entryCandles, atrArr, i, supportLine, resistanceLine) 
 
     if (wickedThrough && closedBelow && bearishRejection && followsThrough) {
       const sl = rejection.high + atrVal * 0.5;
-      const tp = confirm.close - (sl - confirm.close) * 1.5;
+      const tp = confirm.close - (sl - confirm.close) * 2.0;
       return {
         signal: "SELL",
         sl,
@@ -476,7 +552,7 @@ function evaluateBreakout(entryCandles, atrArr, i, lookback = 40) {
     return {
       signal: "BUY",
       sl: c.close - atrVal * 1.2,
-      tp: c.close + atrVal * 2.2,
+      tp: c.close + atrVal * 2.4,
       reason: `Price closed above the ${lookback}-candle high (${highestHigh.toFixed(2)}) with volatility well above average — breakout continuation.`,
     };
   }
@@ -484,8 +560,37 @@ function evaluateBreakout(entryCandles, atrArr, i, lookback = 40) {
     return {
       signal: "SELL",
       sl: c.close + atrVal * 1.2,
-      tp: c.close - atrVal * 2.2,
+      tp: c.close - atrVal * 2.4,
       reason: `Price closed below the ${lookback}-candle low (${lowestLow.toFixed(2)}) with volatility well above average — breakdown continuation.`,
+    };
+  }
+  return null;
+}
+
+// RSI crossing back out of an extreme (oversold/overbought) — a momentum
+// reversal call, distinct from the trend-following strategies above.
+function evaluateRsiReversal(entryCandles, rsiArr, atrArr, i) {
+  if (i - 1 < 0) return null;
+  const prevRsi = rsiArr[i - 1];
+  const currRsi = rsiArr[i];
+  const atrVal = atrArr[i];
+  const price = entryCandles[i].close;
+  if (prevRsi === null || currRsi === null || !atrVal) return null;
+
+  if (prevRsi < 30 && currRsi >= 30) {
+    return {
+      signal: "BUY",
+      sl: price - atrVal * 1.3,
+      tp: price + atrVal * 2.6,
+      reason: `RSI crossed back above 30 (from ${prevRsi.toFixed(1)} to ${currRsi.toFixed(1)}) out of oversold — momentum reversal.`,
+    };
+  }
+  if (prevRsi > 70 && currRsi <= 70) {
+    return {
+      signal: "SELL",
+      sl: price + atrVal * 1.3,
+      tp: price - atrVal * 2.6,
+      reason: `RSI crossed back below 70 (from ${prevRsi.toFixed(1)} to ${currRsi.toFixed(1)}) out of overbought — momentum reversal.`,
     };
   }
   return null;
@@ -589,21 +694,41 @@ async function checkOnce() {
   // Higher-timeframe bias — signals must agree with it (trend filter).
   const htfBias = closesBias(contextCandles);
 
+  // Entry-timeframe regime — trend-following strategies only fire with
+  // a matching trend regime; mean-reversion strategies only while ranging.
+  const entryRegime = classifyRegime(entryCandles, emaSlowArr, atrArr, i);
+  state.regime = entryRegime;
+
   const strategies = [
     {
       key: "emaCross",
       name: "EMA Cross",
+      type: "trend",
       result: evaluateEmaCross(entryCandles, emaFastArr, emaSlowArr, rsiArr, atrArr, i),
+    },
+    {
+      key: "pullback",
+      name: "Pullback",
+      type: "trend",
+      result: evaluatePullback(entryCandles, emaSlowArr, atrArr, i, entryRegime),
     },
     {
       key: "srBounce",
       name: "S/R Bounce",
+      type: "reversion",
       result: evaluateSRBounce(entryCandles, atrArr, i, supportLine, resistanceLine),
     },
     {
       key: "breakout",
       name: "Breakout",
+      type: "trend",
       result: evaluateBreakout(entryCandles, atrArr, i),
+    },
+    {
+      key: "rsiReversal",
+      name: "RSI Reversal",
+      type: "reversion",
+      result: evaluateRsiReversal(entryCandles, rsiArr, atrArr, i),
     },
   ];
 
@@ -617,7 +742,25 @@ async function checkOnce() {
 
     const { signal, sl, tp, reason } = strat.result;
 
-    // --- Filter 1: higher-timeframe trend alignment ---
+    // --- Filter 1: regime match ("strategy tells WHAT, regime tells WHEN") ---
+    if (strat.type === "trend") {
+      const regimeOk =
+        (signal === "BUY" && entryRegime.trend === "trending-up") ||
+        (signal === "SELL" && entryRegime.trend === "trending-down");
+      if (!regimeOk) {
+        console.log(
+          `[${new Date().toISOString()}] ${strat.name} ${signal} skipped — regime is ${entryRegime.trend}, not a matching trend`
+        );
+        continue;
+      }
+    } else if (strat.type === "reversion" && entryRegime.trend !== "ranging") {
+      console.log(
+        `[${new Date().toISOString()}] ${strat.name} ${signal} skipped — regime is ${entryRegime.trend}, not ranging`
+      );
+      continue;
+    }
+
+    // --- Filter 2: higher-timeframe trend alignment ---
     if (REQUIRE_TREND_ALIGNMENT) {
       const aligned =
         (signal === "BUY" && htfBias === "up") || (signal === "SELL" && htfBias === "down");
@@ -629,7 +772,7 @@ async function checkOnce() {
       }
     }
 
-    // --- Filter 2: per-strategy cooldown on the same direction ---
+    // --- Filter 3: per-strategy cooldown on the same direction ---
     const prev = state.strategySignals[strat.key];
     if (prev && prev.lastSignal === signal) {
       const elapsedMin = (nowMs - new Date(prev.firedAtMs || 0).getTime()) / 60000;
@@ -648,7 +791,11 @@ async function checkOnce() {
     };
     anyFired = true;
 
-    const lot = computeLotSize(Math.abs(price - sl));
+    // Volatility expansion → position size may need to decrease.
+    let lot = computeLotSize(Math.abs(price - sl));
+    if (entryRegime.volatilityExpansion && lot) {
+      lot = Math.max(0.01, Math.round(lot * 0.7 * 100) / 100);
+    }
 
     state.lastSignal = signal;
     state.lastSignalTime = time;
@@ -801,7 +948,7 @@ app.post("/api/reset-challenge", (req, res) => {
   state.risk.log = [];
   state.risk.openTrade = null;
   state.risk.dayKey = todayKey();
-  state.strategySignals = { emaCross: null, srBounce: null, breakout: null };
+  state.strategySignals = { emaCross: null, pullback: null, srBounce: null, breakout: null, rsiReversal: null };
   res.json({ ok: true, risk: state.risk });
 });
 
