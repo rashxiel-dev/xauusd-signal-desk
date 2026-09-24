@@ -18,6 +18,12 @@ const path = require("path");
 const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || "";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+// Optional second destination (e.g. a channel) — alerts go to both this
+// and TELEGRAM_CHAT_ID when set. Channel IDs are negative, e.g. -1001234567890.
+const TELEGRAM_CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID || "";
+
+// Every chat/channel the bot should post alerts to, de-duplicated.
+const TELEGRAM_TARGETS = [...new Set([TELEGRAM_CHAT_ID, TELEGRAM_CHANNEL_ID].filter(Boolean))];
 
 const SYMBOL = process.env.SYMBOL || "XAU/USD";
 const INTERVAL = process.env.INTERVAL || "15min"; // entry timeframe
@@ -636,19 +642,29 @@ function evaluateRsiReversal(entryCandles, rsiArr, atrArr, i) {
 
 // ---------------- Telegram ----------------
 async function sendTelegram(message) {
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      chat_id: TELEGRAM_CHAT_ID,
-      text: message,
-      parse_mode: "Markdown",
-    }),
-  });
-  if (!res.ok) {
-    console.error("Telegram send failed:", await res.text());
+  if (!TELEGRAM_TARGETS.length) {
+    console.error("Telegram send skipped: no TELEGRAM_CHAT_ID or TELEGRAM_CHANNEL_ID configured");
+    return;
   }
+
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+  await Promise.all(
+    TELEGRAM_TARGETS.map(async (chatId) => {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          chat_id: chatId,
+          text: message,
+          parse_mode: "Markdown",
+        }),
+      });
+      if (!res.ok) {
+        console.error(`Telegram send failed (chat_id ${chatId}):`, await res.text());
+      }
+    })
+  );
 }
 
 function formatMessage(strategyName, signal, price, rsiVal, time, lot, reason, sl, tp) {
@@ -1077,8 +1093,11 @@ app.listen(PORT, () => {
   const missing = [
     ["TWELVE_DATA_API_KEY", TWELVE_DATA_API_KEY],
     ["TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN],
-    ["TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID],
   ].filter(([, v]) => !v);
+
+  if (!TELEGRAM_TARGETS.length) {
+    missing.push(["TELEGRAM_CHAT_ID or TELEGRAM_CHANNEL_ID", ""]);
+  }
 
   if (missing.length) {
     state.status = "error";
