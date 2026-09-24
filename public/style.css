@@ -457,6 +457,91 @@ html, body {
 .risklog .is-win { color: var(--buy); }
 .risklog .is-loss { color: var(--sell); }
 
+/* ---- daily reports ---- */
+.reportswrap {
+  margin-top: 1px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  padding: 1.5rem;
+}
+
+.reportslist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.85rem;
+}
+
+.reportslist li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.7rem 0;
+  border-top: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+.reportslist li:first-child { border-top: none; }
+
+.reportslist__empty {
+  color: var(--text-muted);
+  justify-content: flex-start !important;
+}
+
+.reportslist__main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.reportslist__date {
+  font-weight: 600;
+}
+
+.reportslist__meta {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.reportslist__pnl.is-win { color: var(--buy); }
+.reportslist__pnl.is-loss { color: var(--sell); }
+
+.reportslist__pdf {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 0.4rem 0.7rem;
+  border: 1px solid var(--gold-dim);
+  background: var(--panel-raised);
+  color: var(--gold);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.reportslist__pdf:hover { border-color: var(--gold); }
+
+/* ---- print-only daily report view ---- */
+#print-report { display: none; }
+
+@media print {
+  body * { visibility: hidden; }
+  #print-report, #print-report * { visibility: visible; }
+  #print-report {
+    display: block;
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    background: #fff;
+    color: #000;
+    font-family: Georgia, serif;
+    padding: 1.5rem;
+  }
+  #print-report h1 { font-size: 1.4rem; margin-bottom: 0.2rem; }
+  #print-report h2 { font-size: 1rem; color: #555; margin-top: 0; font-weight: normal; }
+  #print-report table { border-collapse: collapse; width: 100%; margin-top: 1rem; font-family: monospace; font-size: 0.85rem; }
+  #print-report th, #print-report td { border: 1px solid #999; padding: 0.4rem 0.6rem; text-align: left; }
+  #print-report .print-summary { margin: 1rem 0; font-size: 0.95rem; }
+}
+
 /* ---- footer ---- */
 .desk__footer {
   margin-top: 1.75rem;
