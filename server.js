@@ -32,6 +32,7 @@ const RSI_OVERBOUGHT = 75;
 const RSI_OVERSOLD = 25;
 const SWING_WINDOW = 2; // candles on each side to qualify as a swing point
 const REQUIRE_TREND_ALIGNMENT = process.env.REQUIRE_TREND_ALIGNMENT !== "false";
+const REQUIRE_REGIME_MATCH = process.env.REQUIRE_REGIME_MATCH !== "false";
 const COOLDOWN_MINUTES = parseInt(process.env.COOLDOWN_MINUTES || "30", 10);
 
 const POLL_MS = 15 * 60 * 1000; // full candle + signal check, every 15 minutes
@@ -167,21 +168,42 @@ function computeLotSize(slDistance) {
 }
 
 // Records a win/loss against the risk tracker (shared by auto-resolution
-// and manual override).
-function applyTradeResult(result, note) {
+// and manual override) and, when trade details are available, sends a
+// Telegram alert announcing the outcome.
+async function applyTradeResult(result, note, details) {
   const amount = result === "win" ? RISK_PER_TRADE * (2.5 / 1.5) : -RISK_PER_TRADE;
   state.risk.dailyPnL += amount;
   state.risk.totalPnL += amount;
-  state.risk.log.unshift({ time: new Date().toISOString(), result, amount, note });
+  state.risk.log.unshift({
+    time: new Date().toISOString(),
+    result,
+    amount,
+    note,
+    signal: details?.signal || null,
+    strategy: details?.strategy || null,
+  });
   state.risk.log = state.risk.log.slice(0, 50);
   evaluateHalt();
+
+  if (details) {
+    const emoji = result === "win" ? "✅" : "❌";
+    const label = result === "win" ? "WIN" : "LOSS";
+    const exitPrice = result === "win" ? details.tp : details.sl;
+    const msg =
+      `${emoji} *${label}* — ${details.signal} ${SYMBOL} _(${details.strategy || "signal"})_\n` +
+      `Entry ${details.entryPrice.toFixed(2)} → Exit ~${exitPrice.toFixed(2)}\n` +
+      `P&L: ${amount >= 0 ? "+" : ""}$${amount.toFixed(2)}\n` +
+      `${note === "auto" ? "Auto-resolved against SL/TP" : "Manually logged"}`;
+    await sendTelegram(msg);
+  }
+
   return amount;
 }
 
 // Watches candles after the open trade's entry for the first touch of
 // SL or TP and auto-logs the outcome. If both are touched within the
 // same candle, SL is assumed to have hit first (conservative).
-function resolveOpenTrade(entryCandles) {
+async function resolveOpenTrade(entryCandles) {
   const open = state.risk.openTrade;
   if (!open) return;
 
@@ -194,7 +216,13 @@ function resolveOpenTrade(entryCandles) {
 
     if (hitSL || hitTP) {
       const result = hitSL ? "loss" : "win";
-      applyTradeResult(result, "auto");
+      await applyTradeResult(result, "auto", {
+        signal: open.signal,
+        entryPrice: open.entryPrice,
+        sl: open.sl,
+        tp: open.tp,
+        strategy: open.strategy,
+      });
       console.log(
         `[${new Date().toISOString()}] Auto-resolved ${open.signal} trade as ${result.toUpperCase()} (candle ${c.datetime})`
       );
@@ -390,8 +418,8 @@ function classifyRegime(candles, emaSlowArr, atrArr, i, lookback = 30) {
   const bias = closesBias(slice);
 
   let trend;
-  if (bias === "up" && aboveRatio >= 0.65) trend = "trending-up";
-  else if (bias === "down" && aboveRatio <= 0.35) trend = "trending-down";
+  if (bias === "up" && aboveRatio >= 0.58) trend = "trending-up";
+  else if (bias === "down" && aboveRatio <= 0.42) trend = "trending-down";
   else trend = "ranging";
 
   const priorATRs = atrArr.slice(start, i).filter((v) => v !== null);
@@ -684,7 +712,7 @@ async function checkOnce() {
   resetDailyIfNeeded();
 
   // resolve any trade already being watched before considering new ones
-  resolveOpenTrade(entryCandles);
+  await resolveOpenTrade(entryCandles);
   evaluateHalt();
 
   // trendlines used by both the S/R Bounce strategy and the chart map
@@ -743,7 +771,7 @@ async function checkOnce() {
     const { signal, sl, tp, reason } = strat.result;
 
     // --- Filter 1: regime match ("strategy tells WHAT, regime tells WHEN") ---
-    if (strat.type === "trend") {
+    if (REQUIRE_REGIME_MATCH && strat.type === "trend") {
       const regimeOk =
         (signal === "BUY" && entryRegime.trend === "trending-up") ||
         (signal === "SELL" && entryRegime.trend === "trending-down");
@@ -753,15 +781,17 @@ async function checkOnce() {
         );
         continue;
       }
-    } else if (strat.type === "reversion" && entryRegime.trend !== "ranging") {
+    } else if (REQUIRE_REGIME_MATCH && strat.type === "reversion" && entryRegime.trend !== "ranging") {
       console.log(
         `[${new Date().toISOString()}] ${strat.name} ${signal} skipped — regime is ${entryRegime.trend}, not ranging`
       );
       continue;
     }
 
-    // --- Filter 2: higher-timeframe trend alignment ---
-    if (REQUIRE_TREND_ALIGNMENT) {
+    // --- Filter 2: higher-timeframe trend alignment (trend strategies only — 
+    // requiring H4 alignment on a "ranging" reversion signal is nearly a
+    // contradiction and was blocking almost everything) ---
+    if (REQUIRE_TREND_ALIGNMENT && strat.type === "trend") {
       const aligned =
         (signal === "BUY" && htfBias === "up") || (signal === "SELL" && htfBias === "down");
       if (!aligned) {
@@ -915,14 +945,19 @@ app.get("/api/status", (req, res) => {
 // bot normally resolves this itself against SL/TP). Falls back to a
 // generic log entry if nothing is currently open.
 // body: { result: "win" | "loss" }
-app.post("/api/trade-result", (req, res) => {
+app.post("/api/trade-result", async (req, res) => {
   resetDailyIfNeeded();
   const { result } = req.body || {};
   if (result !== "win" && result !== "loss") {
     return res.status(400).json({ error: "result must be 'win' or 'loss'" });
   }
 
-  applyTradeResult(result, state.risk.openTrade ? "manual override" : "manual");
+  const open = state.risk.openTrade;
+  const details = open
+    ? { signal: open.signal, entryPrice: open.entryPrice, sl: open.sl, tp: open.tp, strategy: open.strategy }
+    : null;
+
+  await applyTradeResult(result, open ? "manual override" : "manual", details);
   state.risk.openTrade = null;
 
   res.json({ ok: true, risk: state.risk });
