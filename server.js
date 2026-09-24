@@ -46,6 +46,15 @@ const PROFIT_TARGET = parseFloat(process.env.PROFIT_TARGET || "500");
 const RISK_PER_TRADE = parseFloat(process.env.RISK_PER_TRADE || "50");
 const XAU_LOT_USD_PER_POINT = 100; // 1.00 lot XAUUSD ≈ $100 per $1 move (100oz)
 
+// Your local timezone as a fixed UTC offset (hours), used only for the
+// daily report's "day boundary" and send time. Maldives is UTC+5, no DST.
+const TIMEZONE_OFFSET_HOURS = parseFloat(process.env.TIMEZONE_OFFSET_HOURS || "5");
+
+function localDateKeyFor(date) {
+  const local = new Date(date.getTime() + TIMEZONE_OFFSET_HOURS * 3600 * 1000);
+  return local.toISOString().slice(0, 10);
+}
+
 // Extra single-day closures beyond the standard weekend (e.g. Christmas,
 // New Year's Day) — comma-separated "YYYY-MM-DD" dates, UTC.
 const HOLIDAY_DATES = (process.env.HOLIDAY_DATES || "")
@@ -110,6 +119,7 @@ const state = {
   lastSignalReason: null,
   strategySignals: { emaCross: null, pullback: null, srBounce: null, breakout: null, rsiReversal: null },
   regime: null,
+  dailyReports: [], // { date, trades, wins, losses, winRate, pnl, byStrategy }[]
   history: [],
   sparkline: [],
   chartMap: null, // { context: {...}, entry: {...}, reason: "" }
@@ -917,6 +927,79 @@ async function pollLoop() {
   }
 }
 
+// ---------------- Daily reports ----------------
+// Builds a summary of every trade resolved (win or loss) on a given
+// local calendar day, broken down by strategy.
+function buildDailyReport(dateKey) {
+  const entries = state.risk.log.filter((l) => localDateKeyFor(new Date(l.time)) === dateKey);
+  const wins = entries.filter((e) => e.result === "win");
+  const losses = entries.filter((e) => e.result === "loss");
+  const pnl = entries.reduce((a, e) => a + e.amount, 0);
+
+  const byStrategy = {};
+  entries.forEach((e) => {
+    const key = e.strategy || "Manual";
+    if (!byStrategy[key]) byStrategy[key] = { wins: 0, losses: 0, pnl: 0 };
+    if (e.result === "win") byStrategy[key].wins += 1;
+    else byStrategy[key].losses += 1;
+    byStrategy[key].pnl += e.amount;
+  });
+
+  return {
+    date: dateKey,
+    trades: entries.length,
+    wins: wins.length,
+    losses: losses.length,
+    winRate: entries.length ? (wins.length / entries.length) * 100 : 0,
+    pnl,
+    byStrategy,
+  };
+}
+
+function formatDailyReportMessage(r) {
+  const lines = [
+    `📊 *Daily Report — ${r.date}*`,
+    "",
+    `Trades: ${r.trades} (${r.wins}W / ${r.losses}L${r.trades ? `, ${r.winRate.toFixed(0)}% win rate` : ""})`,
+    `Net P&L: ${r.pnl >= 0 ? "+" : ""}$${r.pnl.toFixed(2)}`,
+  ];
+  if (r.trades) {
+    lines.push("", "By strategy:");
+    Object.entries(r.byStrategy).forEach(([name, s]) => {
+      lines.push(`• ${name}: ${s.wins}W/${s.losses}L, ${s.pnl >= 0 ? "+" : ""}$${s.pnl.toFixed(2)}`);
+    });
+  } else {
+    lines.push("", "_No trades resolved today._");
+  }
+  return lines.join("\n");
+}
+
+let lastReportLocalDate = null;
+
+// Fires once per local day, right after local midnight, summarizing the
+// day that just ended. Works off wall-clock time, independent of
+// market hours, so it still sends on weekends/holidays if trades
+// happened to resolve right before the close.
+async function maybeSendDailyReport() {
+  const now = new Date();
+  const local = new Date(now.getTime() + TIMEZONE_OFFSET_HOURS * 3600 * 1000);
+  const isJustAfterMidnight = local.getUTCHours() === 0 && local.getUTCMinutes() < 15;
+  const todayLocalKey = localDateKeyFor(now);
+
+  if (isJustAfterMidnight && lastReportLocalDate !== todayLocalKey) {
+    const yesterday = new Date(now.getTime() - 24 * 3600 * 1000);
+    const reportDateKey = localDateKeyFor(yesterday);
+    const report = buildDailyReport(reportDateKey);
+
+    state.dailyReports.unshift(report);
+    state.dailyReports = state.dailyReports.slice(0, 60);
+    await sendTelegram(formatDailyReportMessage(report));
+
+    lastReportLocalDate = todayLocalKey;
+    console.log(`[${new Date().toISOString()}] Sent daily report for ${reportDateKey}`);
+  }
+}
+
 // Lightweight tick between structural checks so the price/chart feel live.
 async function liveLoop() {
   try {
@@ -925,6 +1008,7 @@ async function liveLoop() {
       state.livePrice = price;
       state.liveCheckedAt = new Date().toISOString();
     }
+    await maybeSendDailyReport();
   } catch (err) {
     console.error("Live quote failed:", err.message);
   } finally {
