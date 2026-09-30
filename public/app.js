@@ -292,7 +292,7 @@ function buildReportHTML(r) {
   const rows = Object.entries(r.byStrategy || {})
     .map(
       ([name, s]) =>
-        `<tr><td>${name}</td><td>${s.wins}</td><td>${s.losses}</td><td>${s.pnl >= 0 ? "+" : ""}$${s.pnl.toFixed(2)}</td></tr>`
+        `<tr><td>${name}</td><td>${s.wins}</td><td>${s.losses}</td><td>${s.breakevens || 0}</td><td>${s.pnl >= 0 ? "+" : ""}$${s.pnl.toFixed(2)}</td></tr>`
     )
     .join("");
 
@@ -300,14 +300,14 @@ function buildReportHTML(r) {
     <h1>XAUUSD Signal Desk — Daily Report</h1>
     <h2>${r.date}</h2>
     <div class="print-summary">
-      Trades: ${r.trades} &middot; Wins: ${r.wins} &middot; Losses: ${r.losses} &middot;
+      Trades: ${r.trades} &middot; Wins: ${r.wins} &middot; Losses: ${r.losses} &middot; Breakeven: ${r.breakevens || 0} &middot;
       Win rate: ${r.trades ? r.winRate.toFixed(0) : 0}%<br>
       Net P&amp;L: ${r.pnl >= 0 ? "+" : ""}$${r.pnl.toFixed(2)}
     </div>
     ${
       r.trades
         ? `<table>
-            <thead><tr><th>Strategy</th><th>Wins</th><th>Losses</th><th>P&amp;L</th></tr></thead>
+            <thead><tr><th>Strategy</th><th>Wins</th><th>Losses</th><th>Breakeven</th><th>P&amp;L</th></tr></thead>
             <tbody>${rows}</tbody>
           </table>`
         : `<p>No trades resolved this day.</p>`
@@ -338,7 +338,7 @@ function renderReports(reports) {
         <li>
           <div class="reportslist__main">
             <span class="reportslist__date">${r.date}</span>
-            <span class="reportslist__meta">${r.trades} trade(s) &middot; ${r.wins}W/${r.losses}L${r.trades ? ` &middot; ${r.winRate.toFixed(0)}% win rate` : ""}</span>
+            <span class="reportslist__meta">${r.trades} trade(s) &middot; ${r.wins}W/${r.losses}L/${r.breakevens || 0}BE${r.trades ? ` &middot; ${r.winRate.toFixed(0)}% win rate` : ""}</span>
           </div>
           <span class="reportslist__pnl ${pnlClass}">${r.pnl >= 0 ? "+" : ""}$${r.pnl.toFixed(2)}</span>
           <button class="reportslist__pdf" onclick="downloadReportPDF(${idx})">Download PDF</button>
@@ -387,7 +387,8 @@ function renderRisk(risk) {
     openEl.style.display = "block";
     openEl.innerHTML =
       `Watching open <span class="is-${o.signal === "BUY" ? "win" : "loss"}">${o.signal}</span> from ${fmt(o.entryPrice)} — ` +
-      `auto-resolves on SL ${fmt(o.sl)} / TP ${fmt(o.tp)} touch. Use the buttons below only to override.`;
+      `auto-resolves on SL ${fmt(o.sl)} / TP ${fmt(o.tp)} touch${o.beMoved ? ` <span class="is-breakeven">(stop at breakeven)</span>` : ""}. ` +
+      `Use the buttons below only to override.`;
   } else {
     openEl.style.display = "none";
   }
