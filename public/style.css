@@ -413,6 +413,7 @@ html, body {
 }
 .riskopen .is-win { color: var(--buy); font-weight: 600; }
 .riskopen .is-loss { color: var(--sell); font-weight: 600; }
+.riskopen .is-breakeven { color: var(--gold); font-weight: 400; }
 
 .riskactions {
   display: flex;
@@ -456,6 +457,7 @@ html, body {
 .risklog li:first-child { border-top: none; }
 .risklog .is-win { color: var(--buy); }
 .risklog .is-loss { color: var(--sell); }
+.risklog .is-breakeven { color: var(--gold); }
 
 /* ---- daily reports ---- */
 .reportswrap {
