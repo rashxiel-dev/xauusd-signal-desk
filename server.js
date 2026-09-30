@@ -18,12 +18,14 @@ const path = require("path");
 const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || "";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
-// Optional second destination (e.g. a channel) — alerts go to both this
-// and TELEGRAM_CHAT_ID when set. Channel IDs are negative, e.g. -1001234567890.
-const TELEGRAM_CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID || "";
 
-// Every chat/channel the bot should post alerts to, de-duplicated.
-const TELEGRAM_TARGETS = [...new Set([TELEGRAM_CHAT_ID, TELEGRAM_CHANNEL_ID].filter(Boolean))];
+// Optional persistence: saves risk/report data to a private GitHub Gist
+// so a redeploy doesn't wipe it. Without these set, the bot still works
+// exactly as before, it just starts from zero on every deploy.
+const GIST_TOKEN = process.env.GIST_TOKEN || "";
+const GIST_ID = process.env.GIST_ID || "";
+const PERSISTENCE_ENABLED = !!(GIST_TOKEN && GIST_ID);
+const GIST_FILENAME = "signal-desk-state.json";
 
 const SYMBOL = process.env.SYMBOL || "XAU/USD";
 const INTERVAL = process.env.INTERVAL || "15min"; // entry timeframe
@@ -50,6 +52,10 @@ const DAILY_LOSS_LIMIT = parseFloat(process.env.DAILY_LOSS_LIMIT || "200");
 const MAX_LOSS_LIMIT = parseFloat(process.env.MAX_LOSS_LIMIT || "350");
 const PROFIT_TARGET = parseFloat(process.env.PROFIT_TARGET || "500");
 const RISK_PER_TRADE = parseFloat(process.env.RISK_PER_TRADE || "50");
+// Move SL to entry (breakeven) once a trade is this many pips in favor.
+// This broker counts 1 pip as $0.10 on XAUUSD, so 20 pips = $2.00.
+const BREAKEVEN_TRIGGER_PIPS = parseFloat(process.env.BREAKEVEN_TRIGGER_PIPS || "20");
+const BREAKEVEN_TRIGGER_USD = BREAKEVEN_TRIGGER_PIPS * 0.1;
 const XAU_LOT_USD_PER_POINT = 100; // 1.00 lot XAUUSD ≈ $100 per $1 move (100oz)
 
 // Your local timezone as a fixed UTC offset (hours), used only for the
@@ -187,7 +193,7 @@ function computeLotSize(slDistance) {
 // and manual override) and, when trade details are available, sends a
 // Telegram alert announcing the outcome.
 async function applyTradeResult(result, note, details) {
-  const amount = result === "win" ? RISK_PER_TRADE * (2.5 / 1.5) : -RISK_PER_TRADE;
+  const amount = result === "win" ? RISK_PER_TRADE * (2.5 / 1.5) : result === "breakeven" ? 0 : -RISK_PER_TRADE;
   state.risk.dailyPnL += amount;
   state.risk.totalPnL += amount;
   state.risk.log.unshift({
@@ -200,10 +206,11 @@ async function applyTradeResult(result, note, details) {
   });
   state.risk.log = state.risk.log.slice(0, 50);
   evaluateHalt();
+  schedulePersist();
 
   if (details) {
-    const emoji = result === "win" ? "✅" : "❌";
-    const label = result === "win" ? "WIN" : "LOSS";
+    const emoji = result === "win" ? "✅" : result === "breakeven" ? "⚪" : "❌";
+    const label = result === "win" ? "WIN" : result === "breakeven" ? "BREAKEVEN" : "LOSS";
     const exitPrice = result === "win" ? details.tp : details.sl;
     const msg =
       `${emoji} *${label}* — ${details.signal} ${SYMBOL} _(${details.strategy || "signal"})_\n` +
@@ -216,22 +223,41 @@ async function applyTradeResult(result, note, details) {
   return amount;
 }
 
-// Watches candles after the open trade's entry for the first touch of
-// SL or TP and auto-logs the outcome. If both are touched within the
-// same candle, SL is assumed to have hit first (conservative).
+// Watches candles after the open trade's entry. Once price moves
+// BREAKEVEN_TRIGGER_PIPS in favor, the stop moves to entry (so a
+// reversal from there resolves as breakeven, not a loss) — checked
+// before the SL/TP touch on each candle so both can apply in the same
+// candle if it's a big range bar. If both SL and TP are touched within
+// the same candle, SL is assumed to have hit first (conservative).
 async function resolveOpenTrade(entryCandles) {
   const open = state.risk.openTrade;
   if (!open) return;
 
   const after = entryCandles.filter((c) => c.datetime > open.entryTime);
   for (const c of after) {
+    if (!open.beMoved && BREAKEVEN_TRIGGER_USD > 0) {
+      const favorableMove =
+        open.signal === "BUY" ? c.high - open.entryPrice : open.entryPrice - c.low;
+      if (favorableMove >= BREAKEVEN_TRIGGER_USD) {
+        open.sl = open.entryPrice;
+        open.beMoved = true;
+        await sendTelegram(
+          `🔒 *Breakeven* — ${open.signal} ${SYMBOL} _(${open.strategy || "signal"})_ stop moved to entry ${open.entryPrice.toFixed(2)} after +${BREAKEVEN_TRIGGER_PIPS} pips in favor.`
+        );
+        console.log(
+          `[${new Date().toISOString()}] Moved ${open.signal} trade to breakeven at ${open.entryPrice} (candle ${c.datetime})`
+        );
+        schedulePersist();
+      }
+    }
+
     const hitSL =
       open.signal === "BUY" ? c.low <= open.sl : c.high >= open.sl;
     const hitTP =
       open.signal === "BUY" ? c.high >= open.tp : c.low <= open.tp;
 
     if (hitSL || hitTP) {
-      const result = hitSL ? "loss" : "win";
+      const result = hitSL ? (open.beMoved ? "breakeven" : "loss") : "win";
       await applyTradeResult(result, "auto", {
         signal: open.signal,
         entryPrice: open.entryPrice,
@@ -642,29 +668,19 @@ function evaluateRsiReversal(entryCandles, rsiArr, atrArr, i) {
 
 // ---------------- Telegram ----------------
 async function sendTelegram(message) {
-  if (!TELEGRAM_TARGETS.length) {
-    console.error("Telegram send skipped: no TELEGRAM_CHAT_ID or TELEGRAM_CHANNEL_ID configured");
-    return;
-  }
-
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-
-  await Promise.all(
-    TELEGRAM_TARGETS.map(async (chatId) => {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          chat_id: chatId,
-          text: message,
-          parse_mode: "Markdown",
-        }),
-      });
-      if (!res.ok) {
-        console.error(`Telegram send failed (chat_id ${chatId}):`, await res.text());
-      }
-    })
-  );
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      chat_id: TELEGRAM_CHAT_ID,
+      text: message,
+      parse_mode: "Markdown",
+    }),
+  });
+  if (!res.ok) {
+    console.error("Telegram send failed:", await res.text());
+  }
 }
 
 function formatMessage(strategyName, signal, price, rsiVal, time, lot, reason, sl, tp) {
@@ -876,7 +892,7 @@ async function checkOnce() {
     state.risk.tradesToday += 1;
 
     if (!state.risk.openTrade) {
-      state.risk.openTrade = { signal, entryPrice: price, sl, tp, entryTime: time, strategy: strat.name };
+      state.risk.openTrade = { signal, entryPrice: price, sl, tp, entryTime: time, strategy: strat.name, beMoved: false };
     } else {
       console.log(
         `[${new Date().toISOString()}] ${strat.name} ${signal} fired while a trade is still open — not auto-tracked for P&L`
@@ -884,6 +900,7 @@ async function checkOnce() {
     }
 
     console.log(`[${new Date().toISOString()}] Sent ${strat.name} ${signal} @ ${price}`);
+    schedulePersist();
   }
 
   if (!anyFired) {
@@ -950,13 +967,15 @@ function buildDailyReport(dateKey) {
   const entries = state.risk.log.filter((l) => localDateKeyFor(new Date(l.time)) === dateKey);
   const wins = entries.filter((e) => e.result === "win");
   const losses = entries.filter((e) => e.result === "loss");
+  const breakevens = entries.filter((e) => e.result === "breakeven");
   const pnl = entries.reduce((a, e) => a + e.amount, 0);
 
   const byStrategy = {};
   entries.forEach((e) => {
     const key = e.strategy || "Manual";
-    if (!byStrategy[key]) byStrategy[key] = { wins: 0, losses: 0, pnl: 0 };
+    if (!byStrategy[key]) byStrategy[key] = { wins: 0, losses: 0, breakevens: 0, pnl: 0 };
     if (e.result === "win") byStrategy[key].wins += 1;
+    else if (e.result === "breakeven") byStrategy[key].breakevens += 1;
     else byStrategy[key].losses += 1;
     byStrategy[key].pnl += e.amount;
   });
@@ -966,6 +985,7 @@ function buildDailyReport(dateKey) {
     trades: entries.length,
     wins: wins.length,
     losses: losses.length,
+    breakevens: breakevens.length,
     winRate: entries.length ? (wins.length / entries.length) * 100 : 0,
     pnl,
     byStrategy,
@@ -976,13 +996,13 @@ function formatDailyReportMessage(r) {
   const lines = [
     `📊 *Daily Report — ${r.date}*`,
     "",
-    `Trades: ${r.trades} (${r.wins}W / ${r.losses}L${r.trades ? `, ${r.winRate.toFixed(0)}% win rate` : ""})`,
+    `Trades: ${r.trades} (${r.wins}W / ${r.losses}L / ${r.breakevens || 0}BE${r.trades ? `, ${r.winRate.toFixed(0)}% win rate` : ""})`,
     `Net P&L: ${r.pnl >= 0 ? "+" : ""}$${r.pnl.toFixed(2)}`,
   ];
   if (r.trades) {
     lines.push("", "By strategy:");
     Object.entries(r.byStrategy).forEach(([name, s]) => {
-      lines.push(`• ${name}: ${s.wins}W/${s.losses}L, ${s.pnl >= 0 ? "+" : ""}$${s.pnl.toFixed(2)}`);
+      lines.push(`• ${name}: ${s.wins}W/${s.losses}L/${s.breakevens || 0}BE, ${s.pnl >= 0 ? "+" : ""}$${s.pnl.toFixed(2)}`);
     });
   } else {
     lines.push("", "_No trades resolved today._");
@@ -1013,6 +1033,7 @@ async function maybeSendDailyReport() {
 
     lastReportLocalDate = todayLocalKey;
     console.log(`[${new Date().toISOString()}] Sent daily report for ${reportDateKey}`);
+    schedulePersist();
   }
 }
 
@@ -1030,6 +1051,85 @@ async function liveLoop() {
   } finally {
     setTimeout(liveLoop, LIVE_POLL_MS);
   }
+}
+
+// ---------------- Persistence (GitHub Gist) ----------------
+// Only the data that should survive a redeploy — not live market
+// snapshots like price/RSI/chart, which refresh from the API anyway
+// within a few minutes of startup.
+function persistableSnapshot() {
+  return {
+    risk: state.risk,
+    dailyReports: state.dailyReports,
+    strategySignals: state.strategySignals,
+    lastSignal: state.lastSignal,
+    lastSignalTime: state.lastSignalTime,
+    lastSignalPrice: state.lastSignalPrice,
+    lastSignalStrategy: state.lastSignalStrategy,
+    lastSignalReason: state.lastSignalReason,
+    history: state.history,
+    savedAt: new Date().toISOString(),
+  };
+}
+
+async function loadPersistedState() {
+  if (!PERSISTENCE_ENABLED) return;
+  try {
+    const res = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+      headers: {
+        Authorization: `token ${GIST_TOKEN}`,
+        Accept: "application/vnd.github+json",
+      },
+    });
+    const data = await res.json();
+    const file = data.files && data.files[GIST_FILENAME];
+    if (!file || !file.content) {
+      console.log("No prior saved state found in Gist — starting fresh.");
+      return;
+    }
+    const saved = JSON.parse(file.content);
+
+    if (saved.risk) Object.assign(state.risk, saved.risk);
+    state.dailyReports = saved.dailyReports || [];
+    state.strategySignals = saved.strategySignals || state.strategySignals;
+    state.lastSignal = saved.lastSignal ?? null;
+    state.lastSignalTime = saved.lastSignalTime ?? null;
+    state.lastSignalPrice = saved.lastSignalPrice ?? null;
+    state.lastSignalStrategy = saved.lastSignalStrategy ?? null;
+    state.lastSignalReason = saved.lastSignalReason ?? null;
+    state.history = saved.history || [];
+
+    console.log(`Restored saved state from Gist (last saved ${saved.savedAt || "unknown time"}).`);
+  } catch (err) {
+    console.error("Failed to load persisted state:", err.message);
+  }
+}
+
+let persistTimer = null;
+function schedulePersist() {
+  if (!PERSISTENCE_ENABLED) return;
+  clearTimeout(persistTimer);
+  // debounce so several rapid changes only trigger one save
+  persistTimer = setTimeout(async () => {
+    try {
+      const res = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `token ${GIST_TOKEN}`,
+          Accept: "application/vnd.github+json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          files: { [GIST_FILENAME]: { content: JSON.stringify(persistableSnapshot(), null, 2) } },
+        }),
+      });
+      if (!res.ok) {
+        console.error("Persist to Gist failed:", res.status, await res.text());
+      }
+    } catch (err) {
+      console.error("Persist to Gist failed:", err.message);
+    }
+  }, 5000);
 }
 
 // ---------------- Web server ----------------
@@ -1071,6 +1171,7 @@ app.post("/api/reset-day", (req, res) => {
     state.risk.halted = false;
     state.risk.haltReason = null;
   }
+  schedulePersist();
   res.json({ ok: true, risk: state.risk });
 });
 
@@ -1084,26 +1185,30 @@ app.post("/api/reset-challenge", (req, res) => {
   state.risk.openTrade = null;
   state.risk.dayKey = todayKey();
   state.strategySignals = { emaCross: null, pullback: null, srBounce: null, breakout: null, rsiReversal: null };
+  schedulePersist();
   res.json({ ok: true, risk: state.risk });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Dashboard running on port ${PORT}`);
 
   const missing = [
     ["TWELVE_DATA_API_KEY", TWELVE_DATA_API_KEY],
     ["TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN],
+    ["TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID],
   ].filter(([, v]) => !v);
-
-  if (!TELEGRAM_TARGETS.length) {
-    missing.push(["TELEGRAM_CHAT_ID or TELEGRAM_CHANNEL_ID", ""]);
-  }
 
   if (missing.length) {
     state.status = "error";
     state.lastError = `Missing config: ${missing.map(([n]) => n).join(", ")}`;
     console.error(state.lastError);
     return;
+  }
+
+  if (PERSISTENCE_ENABLED) {
+    await loadPersistedState();
+  } else {
+    console.log("GIST_TOKEN/GIST_ID not set — running without persistence (data resets on every deploy).");
   }
 
   pollLoop();
