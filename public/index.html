@@ -28,6 +28,63 @@
       </div>
     </header>
 
+    <section class="acctwrap">
+      <div class="panel__label">My account <span class="acctwrap__hint">(saved only in this browser — not shared with anyone)</span></div>
+
+      <form class="acctform" id="account-form">
+        <div class="acctform__row">
+          <label>Account balance
+            <input type="number" id="acct-balance" min="0" step="0.01" placeholder="5000" required>
+          </label>
+          <label>Risk per trade ($)
+            <input type="number" id="acct-risk" min="0" step="0.01" placeholder="50" required>
+          </label>
+        </div>
+
+        <label class="acctform__toggle">
+          <input type="checkbox" id="acct-is-challenge">
+          I'm doing a funded/prop challenge
+        </label>
+
+        <div class="acctform__row" id="acct-challenge-fields" style="display:none;">
+          <label>Daily loss limit ($)
+            <input type="number" id="acct-daily-limit" min="0" step="0.01" placeholder="200">
+          </label>
+          <label>Max loss limit ($)
+            <input type="number" id="acct-max-limit" min="0" step="0.01" placeholder="350">
+          </label>
+          <label>Profit target ($)
+            <input type="number" id="acct-target" min="0" step="0.01" placeholder="500">
+          </label>
+        </div>
+
+        <button type="submit" class="riskbtn riskbtn--win">Save my account</button>
+      </form>
+
+      <div class="acctstats" id="acct-stats" style="display:none;">
+        <div class="acctstats__summary" id="acct-summary"></div>
+
+        <div class="riskgrid" id="acct-bars" style="display:none;">
+          <div class="riskcol">
+            <div class="risklabel">Your daily P&amp;L <span id="acct-daily-limit-label"></span></div>
+            <div class="riskbar"><div class="riskbar__fill" id="acct-daily-fill"></div></div>
+            <div class="riskvalue" id="acct-daily-value">$0.00</div>
+          </div>
+          <div class="riskcol">
+            <div class="risklabel">Your total P&amp;L <span id="acct-total-limit-label"></span></div>
+            <div class="riskbar"><div class="riskbar__fill" id="acct-total-fill"></div></div>
+            <div class="riskvalue" id="acct-total-value">$0.00</div>
+          </div>
+        </div>
+
+        <div class="acctstats__nochallenge" id="acct-simple-pnl" style="display:none;"></div>
+
+        <div class="acctstats__lot" id="acct-lot"></div>
+
+        <button class="riskbtn riskbtn--ghost" id="acct-edit-btn">Edit my account</button>
+      </div>
+    </section>
+
     <main class="desk__grid">
 
       <section class="panel panel--price">
