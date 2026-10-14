@@ -64,6 +64,16 @@ pm2 save
 Env vars in `.env`: `SYMBOL`, `INTERVAL`. Strategy constants
 (EMA periods, RSI thresholds, SL/TP multipliers) are in `server.js`.
 
+### Scale-in rule
+If a strategy fires the same direction again while a trade is already open,
+it's treated as an **add** to that trade rather than a fresh signal — but
+only once the open trade already has a leg at breakeven. The add is sized
+at a smaller fixed risk (0.5% of account by default, vs. the full
+`RISK_PER_TRADE` on the original entry), and each trade is capped at 1 add
+by default. Telegram alerts for an add are labeled `SCALE-IN ADD #1`.
+Tune with `SCALE_IN_ENABLED` (`true`/`false`), `SCALE_IN_RISK_PCT`, and
+`SCALE_IN_MAX_ADDS`.
+
 ## Notes
 - This is a technical-indicator signal generator, not financial advice —
   confirm against your own analysis and risk plan before trading.
