@@ -382,13 +382,24 @@ function renderRisk(risk) {
     `$${risk.riskPerTrade} risked per trade on a $${risk.accountSize} account · ${risk.tradesToday} alert(s) sent today`;
 
   const openEl = document.getElementById("risk-open-trade");
-  if (risk.openTrade) {
+  if (risk.openTrade && risk.openTrade.legs && risk.openTrade.legs.length) {
     const o = risk.openTrade;
+    const main = o.legs.find((l) => !l.addNumber) || o.legs[0];
+    const adds = o.legs.filter((l) => l.addNumber);
     openEl.style.display = "block";
-    openEl.innerHTML =
-      `Watching open <span class="is-${o.signal === "BUY" ? "win" : "loss"}">${o.signal}</span> from ${fmt(o.entryPrice)} — ` +
-      `auto-resolves on SL ${fmt(o.sl)} / TP ${fmt(o.tp)} touch${o.beMoved ? ` <span class="is-breakeven">(stop at breakeven)</span>` : ""}. ` +
-      `Use the buttons below only to override.`;
+    let html =
+      `Watching open <span class="is-${o.signal === "BUY" ? "win" : "loss"}">${o.signal}</span> from ${fmt(main.entryPrice)} — ` +
+      `auto-resolves on SL ${fmt(main.sl)} / TP ${fmt(main.tp)} touch${main.beMoved ? ` <span class="is-breakeven">(stop at breakeven)</span>` : ""}. `;
+    if (adds.length) {
+      html += adds
+        .map(
+          (a) =>
+            `<br>Scale-in ADD #${a.addNumber} from ${fmt(a.entryPrice)} — SL ${fmt(a.sl)} / TP ${fmt(a.tp)}${a.beMoved ? ` <span class="is-breakeven">(stop at breakeven)</span>` : ""}.`
+        )
+        .join("");
+    }
+    html += ` Use the buttons below only to override (closes every leg).`;
+    openEl.innerHTML = html;
   } else {
     openEl.style.display = "none";
   }
@@ -400,7 +411,7 @@ function renderRisk(risk) {
     log.innerHTML = risk.log
       .map(
         (l) =>
-          `<li><span class="is-${l.result}">${l.result.toUpperCase()}</span><span>${l.amount >= 0 ? "+" : ""}$${l.amount.toFixed(2)} · ${timeAgo(l.time)}</span></li>`
+          `<li><span class="is-${l.result}">${l.result.toUpperCase()}${l.addNumber ? ` ADD#${l.addNumber}` : ""}</span><span>${l.amount >= 0 ? "+" : ""}$${l.amount.toFixed(2)} · ${timeAgo(l.time)}</span></li>`
       )
       .join("");
   }
