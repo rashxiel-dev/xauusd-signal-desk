@@ -58,6 +58,17 @@ const BREAKEVEN_TRIGGER_PIPS = parseFloat(process.env.BREAKEVEN_TRIGGER_PIPS || 
 const BREAKEVEN_TRIGGER_USD = BREAKEVEN_TRIGGER_PIPS * 0.1;
 const XAU_LOT_USD_PER_POINT = 100; // 1.00 lot XAUUSD ≈ $100 per $1 move (100oz)
 
+// ---- Scale-in rule ("Risk Officer" style) ----
+// If a strategy re-fires the same direction while the open trade is
+// already being watched, it's no longer silently dropped from P&L
+// tracking. It becomes an "add" to that trade — but only once the
+// existing leg has already moved to breakeven, sized at a smaller fixed
+// risk (not the full RISK_PER_TRADE), and capped per trade.
+const SCALE_IN_ENABLED = process.env.SCALE_IN_ENABLED !== "false";
+const SCALE_IN_RISK_PCT = parseFloat(process.env.SCALE_IN_RISK_PCT || "0.5");
+const SCALE_IN_RISK_USD = (ACCOUNT_SIZE * SCALE_IN_RISK_PCT) / 100;
+const SCALE_IN_MAX_ADDS = parseInt(process.env.SCALE_IN_MAX_ADDS || "1", 10);
+
 // Your local timezone as a fixed UTC offset (hours), used only for the
 // daily report's "day boundary" and send time. Maldives is UTC+5, no DST.
 const TIMEZONE_OFFSET_HOURS = parseFloat(process.env.TIMEZONE_OFFSET_HOURS || "5");
@@ -189,11 +200,19 @@ function computeLotSize(slDistance) {
   return Math.max(0.01, Math.round(raw * 100) / 100);
 }
 
+// Same shape, but sized against the smaller scale-in risk budget
+// (SCALE_IN_RISK_USD) instead of the full RISK_PER_TRADE.
+function computeScaleInLotSize(slDistance) {
+  if (!slDistance || slDistance <= 0) return null;
+  const raw = SCALE_IN_RISK_USD / (slDistance * XAU_LOT_USD_PER_POINT);
+  return Math.max(0.01, Math.round(raw * 100) / 100);
+}
+
 // Records a win/loss against the risk tracker (shared by auto-resolution
 // and manual override) and, when trade details are available, sends a
 // Telegram alert announcing the outcome.
-async function applyTradeResult(result, note, details) {
-  const amount = result === "win" ? RISK_PER_TRADE * (2.5 / 1.5) : result === "breakeven" ? 0 : -RISK_PER_TRADE;
+async function applyTradeResult(result, note, details, riskUsd = RISK_PER_TRADE) {
+  const amount = result === "win" ? riskUsd * (2.5 / 1.5) : result === "breakeven" ? 0 : -riskUsd;
   state.risk.dailyPnL += amount;
   state.risk.totalPnL += amount;
   state.risk.log.unshift({
@@ -203,6 +222,7 @@ async function applyTradeResult(result, note, details) {
     note,
     signal: details?.signal || null,
     strategy: details?.strategy || null,
+    addNumber: details?.addNumber || 0,
   });
   state.risk.log = state.risk.log.slice(0, 50);
   evaluateHalt();
@@ -212,8 +232,9 @@ async function applyTradeResult(result, note, details) {
     const emoji = result === "win" ? "✅" : result === "breakeven" ? "⚪" : "❌";
     const label = result === "win" ? "WIN" : result === "breakeven" ? "BREAKEVEN" : "LOSS";
     const exitPrice = result === "win" ? details.tp : details.sl;
+    const addTag = details.addNumber ? ` · ADD #${details.addNumber}` : "";
     const msg =
-      `${emoji} *${label}* — ${details.signal} ${SYMBOL} _(${details.strategy || "signal"})_\n` +
+      `${emoji} *${label}* — ${details.signal} ${SYMBOL} _(${details.strategy || "signal"}${addTag})_\n` +
       `Entry ${details.entryPrice.toFixed(2)} → Exit ~${exitPrice.toFixed(2)}\n` +
       `P&L: ${amount >= 0 ? "+" : ""}$${amount.toFixed(2)}\n` +
       `${note === "auto" ? "Auto-resolved against SL/TP" : "Manually logged"}`;
@@ -229,48 +250,68 @@ async function applyTradeResult(result, note, details) {
 // before the SL/TP touch on each candle so both can apply in the same
 // candle if it's a big range bar. If both SL and TP are touched within
 // the same candle, SL is assumed to have hit first (conservative).
+// A trade is now (possibly) several legs: the original entry plus any
+// scale-in adds, each with its own entry/SL/TP/breakeven state. Each leg
+// is watched and resolved independently; the trade as a whole stays
+// "open" until every leg has resolved.
 async function resolveOpenTrade(entryCandles) {
   const open = state.risk.openTrade;
   if (!open) return;
 
-  const after = entryCandles.filter((c) => c.datetime > open.entryTime);
-  for (const c of after) {
-    if (!open.beMoved && BREAKEVEN_TRIGGER_USD > 0) {
-      const favorableMove =
-        open.signal === "BUY" ? c.high - open.entryPrice : open.entryPrice - c.low;
-      if (favorableMove >= BREAKEVEN_TRIGGER_USD) {
-        open.sl = open.entryPrice;
-        open.beMoved = true;
-        await sendTelegram(
-          `🔒 *Breakeven* — ${open.signal} ${SYMBOL} _(${open.strategy || "signal"})_ stop moved to entry ${open.entryPrice.toFixed(2)} after +${BREAKEVEN_TRIGGER_PIPS} pips in favor.`
+  const stillOpenLegs = [];
+  for (const leg of open.legs) {
+    const after = entryCandles.filter((c) => c.datetime > leg.entryTime);
+    let resolved = false;
+
+    for (const c of after) {
+      if (!leg.beMoved && BREAKEVEN_TRIGGER_USD > 0) {
+        const favorableMove = open.signal === "BUY" ? c.high - leg.entryPrice : leg.entryPrice - c.low;
+        if (favorableMove >= BREAKEVEN_TRIGGER_USD) {
+          leg.sl = leg.entryPrice;
+          leg.beMoved = true;
+          const addTag = leg.addNumber ? ` ADD #${leg.addNumber}` : "";
+          await sendTelegram(
+            `🔒 *Breakeven* — ${open.signal} ${SYMBOL} _(${leg.strategy || "signal"}${addTag})_ stop moved to entry ${leg.entryPrice.toFixed(2)} after +${BREAKEVEN_TRIGGER_PIPS} pips in favor.`
+          );
+          console.log(
+            `[${new Date().toISOString()}] Moved ${open.signal}${addTag} leg to breakeven at ${leg.entryPrice} (candle ${c.datetime})`
+          );
+          schedulePersist();
+        }
+      }
+
+      const hitSL = open.signal === "BUY" ? c.low <= leg.sl : c.high >= leg.sl;
+      const hitTP = open.signal === "BUY" ? c.high >= leg.tp : c.low <= leg.tp;
+
+      if (hitSL || hitTP) {
+        const result = hitSL ? (leg.beMoved ? "breakeven" : "loss") : "win";
+        await applyTradeResult(
+          result,
+          "auto",
+          {
+            signal: open.signal,
+            entryPrice: leg.entryPrice,
+            sl: leg.sl,
+            tp: leg.tp,
+            strategy: leg.strategy,
+            addNumber: leg.addNumber,
+          },
+          leg.riskUsd
         );
         console.log(
-          `[${new Date().toISOString()}] Moved ${open.signal} trade to breakeven at ${open.entryPrice} (candle ${c.datetime})`
+          `[${new Date().toISOString()}] Auto-resolved ${open.signal}${leg.addNumber ? ` ADD #${leg.addNumber}` : ""} leg as ${result.toUpperCase()} (candle ${c.datetime})`
         );
-        schedulePersist();
+        resolved = true;
+        break;
       }
     }
 
-    const hitSL =
-      open.signal === "BUY" ? c.low <= open.sl : c.high >= open.sl;
-    const hitTP =
-      open.signal === "BUY" ? c.high >= open.tp : c.low <= open.tp;
+    if (!resolved) stillOpenLegs.push(leg);
+  }
 
-    if (hitSL || hitTP) {
-      const result = hitSL ? (open.beMoved ? "breakeven" : "loss") : "win";
-      await applyTradeResult(result, "auto", {
-        signal: open.signal,
-        entryPrice: open.entryPrice,
-        sl: open.sl,
-        tp: open.tp,
-        strategy: open.strategy,
-      });
-      console.log(
-        `[${new Date().toISOString()}] Auto-resolved ${open.signal} trade as ${result.toUpperCase()} (candle ${c.datetime})`
-      );
-      state.risk.openTrade = null;
-      return;
-    }
+  open.legs = stillOpenLegs;
+  if (open.legs.length === 0) {
+    state.risk.openTrade = null;
   }
 }
 
@@ -683,16 +724,23 @@ async function sendTelegram(message) {
   }
 }
 
-function formatMessage(strategyName, signal, price, rsiVal, time, lot, reason, sl, tp) {
+function formatMessage(strategyName, signal, price, rsiVal, time, lot, reason, sl, tp, addNumber = 0) {
+  const header = addNumber
+    ? `*${signal} SCALE-IN ADD #${addNumber} — ${SYMBOL}* _(${strategyName})_`
+    : `*${signal} SIGNAL — ${SYMBOL}* _(${strategyName})_`;
+  const riskNote = addNumber
+    ? `Suggested lot: ${lot ? lot.toFixed(2) : "—"} (add-on risk $${SCALE_IN_RISK_USD.toFixed(2)} — ${SCALE_IN_RISK_PCT}% of account)\n` +
+      `_Scale-in: the open leg is already at breakeven, so this add only risks fresh money._\n`
+    : `Suggested lot: ${lot ? lot.toFixed(2) : "—"} (risking $${RISK_PER_TRADE} on a $${ACCOUNT_SIZE} account)\n`;
   return (
-    `*${signal} SIGNAL — ${SYMBOL}* _(${strategyName})_\n` +
+    `${header}\n` +
     `Time: ${time}\n` +
     `Price: ${price.toFixed(2)}\n` +
     `RSI(${RSI_PERIOD}): ${rsiVal.toFixed(1)}\n` +
     `${reason}\n` +
     `Suggested SL: ${sl.toFixed(2)}\n` +
     `Suggested TP: ${tp.toFixed(2)}\n` +
-    `Suggested lot: ${lot ? lot.toFixed(2) : "—"} (risking $${RISK_PER_TRADE} on a $${ACCOUNT_SIZE} account)\n` +
+    riskNote +
     `_Signal only — not financial advice. Confirm before trading._`
   );
 }
@@ -863,8 +911,33 @@ async function checkOnce() {
     };
     anyFired = true;
 
+    // Scale-in decision: if a trade is already open in the SAME
+    // direction, this re-fire is a candidate add, not a brand-new trade.
+    // It only proceeds once the open trade already has a leg at
+    // breakeven, and only up to SCALE_IN_MAX_ADDS adds per trade.
+    // A trade open in the OPPOSITE direction, or any re-fire with scale-in
+    // disabled, falls back to the original behavior: alert sent, not
+    // tracked for P&L (this dashboard watches one trade at a time).
+    let addNumber = 0;
+    let trackThis = !state.risk.openTrade;
+    if (state.risk.openTrade && SCALE_IN_ENABLED && state.risk.openTrade.signal === signal) {
+      const legs = state.risk.openTrade.legs;
+      const addsSoFar = legs.filter((l) => l.addNumber > 0).length;
+      const anyAtBreakeven = legs.some((l) => l.beMoved);
+      if (addsSoFar < SCALE_IN_MAX_ADDS && anyAtBreakeven) {
+        addNumber = addsSoFar + 1;
+        trackThis = true;
+      } else {
+        console.log(
+          `[${new Date().toISOString()}] ${strat.name} ${signal} not scaled in — ${
+            addsSoFar >= SCALE_IN_MAX_ADDS ? `add cap (${SCALE_IN_MAX_ADDS}) reached` : "open leg not at breakeven yet"
+          }`
+        );
+      }
+    }
+
     // Volatility expansion → position size may need to decrease.
-    let lot = computeLotSize(Math.abs(price - sl));
+    let lot = addNumber > 0 ? computeScaleInLotSize(Math.abs(price - sl)) : computeLotSize(Math.abs(price - sl));
     if (entryRegime.volatilityExpansion && lot) {
       lot = Math.max(0.01, Math.round(lot * 0.7 * 100) / 100);
     }
@@ -877,7 +950,7 @@ async function checkOnce() {
     state.suggestedSL = sl;
     state.suggestedTP = tp;
     state.suggestedLot = lot;
-    state.history.unshift({ time, signal, price, strategy: strat.name });
+    state.history.unshift({ time, signal, price, strategy: strat.name, addNumber });
     state.history = state.history.slice(0, 30);
 
     if (state.risk.halted) {
@@ -887,19 +960,36 @@ async function checkOnce() {
       continue;
     }
 
-    const msg = formatMessage(strat.name, signal, price, rsiArr[i], time, lot, reason, sl, tp);
+    const msg = formatMessage(strat.name, signal, price, rsiArr[i], time, lot, reason, sl, tp, addNumber);
     await sendTelegram(msg);
     state.risk.tradesToday += 1;
 
     if (!state.risk.openTrade) {
-      state.risk.openTrade = { signal, entryPrice: price, sl, tp, entryTime: time, strategy: strat.name, beMoved: false };
+      state.risk.openTrade = {
+        signal,
+        legs: [
+          { entryPrice: price, sl, tp, entryTime: time, strategy: strat.name, beMoved: false, addNumber: 0, riskUsd: RISK_PER_TRADE, lot },
+        ],
+      };
+    } else if (trackThis && addNumber > 0) {
+      state.risk.openTrade.legs.push({
+        entryPrice: price,
+        sl,
+        tp,
+        entryTime: time,
+        strategy: strat.name,
+        beMoved: false,
+        addNumber,
+        riskUsd: SCALE_IN_RISK_USD,
+        lot,
+      });
     } else {
       console.log(
         `[${new Date().toISOString()}] ${strat.name} ${signal} fired while a trade is still open — not auto-tracked for P&L`
       );
     }
 
-    console.log(`[${new Date().toISOString()}] Sent ${strat.name} ${signal} @ ${price}`);
+    console.log(`[${new Date().toISOString()}] Sent ${strat.name} ${signal}${addNumber ? ` (ADD #${addNumber})` : ""} @ ${price}`);
     schedulePersist();
   }
 
@@ -1153,11 +1243,20 @@ app.post("/api/trade-result", async (req, res) => {
   }
 
   const open = state.risk.openTrade;
-  const details = open
-    ? { signal: open.signal, entryPrice: open.entryPrice, sl: open.sl, tp: open.tp, strategy: open.strategy }
-    : null;
-
-  await applyTradeResult(result, open ? "manual override" : "manual", details);
+  if (open) {
+    // Manual override closes every open leg (original + any scale-in
+    // adds) at once, each logged against its own risk size.
+    for (const leg of open.legs) {
+      await applyTradeResult(
+        result,
+        "manual override",
+        { signal: open.signal, entryPrice: leg.entryPrice, sl: leg.sl, tp: leg.tp, strategy: leg.strategy, addNumber: leg.addNumber },
+        leg.riskUsd
+      );
+    }
+  } else {
+    await applyTradeResult(result, "manual", null);
+  }
   state.risk.openTrade = null;
 
   res.json({ ok: true, risk: state.risk });
