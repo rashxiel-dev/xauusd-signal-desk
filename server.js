@@ -56,6 +56,16 @@ const RISK_PER_TRADE = parseFloat(process.env.RISK_PER_TRADE || "50");
 // This broker counts 1 pip as $0.10 on XAUUSD, so 20 pips = $2.00.
 const BREAKEVEN_TRIGGER_PIPS = parseFloat(process.env.BREAKEVEN_TRIGGER_PIPS || "20");
 const BREAKEVEN_TRIGGER_USD = BREAKEVEN_TRIGGER_PIPS * 0.1;
+// R-based breakeven: move the stop to entry once the trade is this many
+// multiples of its ORIGINAL stop distance in profit (1.0 = "1R"). This
+// scales with volatility instead of a flat $2 that normal noise reaches
+// constantly. Set BREAKEVEN_R=0 to fall back to the flat-pips trigger.
+const BREAKEVEN_R = parseFloat(process.env.BREAKEVEN_R || "1.0");
+
+function breakevenTriggerUsd(leg) {
+  if (BREAKEVEN_R > 0 && leg.stopDist > 0) return leg.stopDist * BREAKEVEN_R;
+  return BREAKEVEN_TRIGGER_USD;
+}
 const XAU_LOT_USD_PER_POINT = 100; // 1.00 lot XAUUSD ≈ $100 per $1 move (100oz)
 
 // ---- Scale-in rule ("Risk Officer" style) ----
@@ -223,6 +233,10 @@ async function applyTradeResult(result, note, details, riskUsd = RISK_PER_TRADE)
     signal: details?.signal || null,
     strategy: details?.strategy || null,
     addNumber: details?.addNumber || 0,
+    // peak favorable move (USD and in R) before the trade closed — lets
+    // you check whether breakeven is cutting off would-be winners
+    mfe: details?.mfe ?? null,
+    mfeR: details?.mfeR ?? null,
   });
   state.risk.log = state.risk.log.slice(0, 50);
   evaluateHalt();
@@ -245,7 +259,7 @@ async function applyTradeResult(result, note, details, riskUsd = RISK_PER_TRADE)
 }
 
 // Watches candles after the open trade's entry. Once price moves
-// BREAKEVEN_TRIGGER_PIPS in favor, the stop moves to entry (so a
+// BREAKEVEN_R x its original stop distance in favor, the stop moves to entry (so a
 // reversal from there resolves as breakeven, not a loss) — checked
 // before the SL/TP touch on each candle so both can apply in the same
 // candle if it's a big range bar. If both SL and TP are touched within
@@ -264,14 +278,17 @@ async function resolveOpenTrade(entryCandles) {
     let resolved = false;
 
     for (const c of after) {
-      if (!leg.beMoved && BREAKEVEN_TRIGGER_USD > 0) {
-        const favorableMove = open.signal === "BUY" ? c.high - leg.entryPrice : leg.entryPrice - c.low;
-        if (favorableMove >= BREAKEVEN_TRIGGER_USD) {
+      const favorableMove = open.signal === "BUY" ? c.high - leg.entryPrice : leg.entryPrice - c.low;
+      if (favorableMove > (leg.mfe || 0)) leg.mfe = favorableMove;
+
+      const beTrigger = breakevenTriggerUsd(leg);
+      if (!leg.beMoved && beTrigger > 0) {
+        if (favorableMove >= beTrigger) {
           leg.sl = leg.entryPrice;
           leg.beMoved = true;
           const addTag = leg.addNumber ? ` ADD #${leg.addNumber}` : "";
           await sendTelegram(
-            `🔒 *Breakeven* — ${open.signal} ${SYMBOL} _(${leg.strategy || "signal"}${addTag})_ stop moved to entry ${leg.entryPrice.toFixed(2)} after +${BREAKEVEN_TRIGGER_PIPS} pips in favor.`
+            `🔒 *Breakeven* — ${open.signal} ${SYMBOL} _(${leg.strategy || "signal"}${addTag})_ stop moved to entry ${leg.entryPrice.toFixed(2)} after +$${beTrigger.toFixed(2)} in favor${BREAKEVEN_R > 0 ? ` (${BREAKEVEN_R}R)` : ""}.`
           );
           console.log(
             `[${new Date().toISOString()}] Moved ${open.signal}${addTag} leg to breakeven at ${leg.entryPrice} (candle ${c.datetime})`
@@ -295,6 +312,8 @@ async function resolveOpenTrade(entryCandles) {
             tp: leg.tp,
             strategy: leg.strategy,
             addNumber: leg.addNumber,
+            mfe: leg.mfe || 0,
+            mfeR: leg.stopDist > 0 ? (leg.mfe || 0) / leg.stopDist : null,
           },
           leg.riskUsd
         );
@@ -968,7 +987,7 @@ async function checkOnce() {
       state.risk.openTrade = {
         signal,
         legs: [
-          { entryPrice: price, sl, tp, entryTime: time, strategy: strat.name, beMoved: false, addNumber: 0, riskUsd: RISK_PER_TRADE, lot },
+          { entryPrice: price, sl, tp, entryTime: time, strategy: strat.name, beMoved: false, addNumber: 0, riskUsd: RISK_PER_TRADE, lot, stopDist: Math.abs(price - sl), mfe: 0 },
         ],
       };
     } else if (trackThis && addNumber > 0) {
@@ -982,6 +1001,8 @@ async function checkOnce() {
         addNumber,
         riskUsd: SCALE_IN_RISK_USD,
         lot,
+        stopDist: Math.abs(price - sl),
+        mfe: 0,
       });
     } else {
       console.log(
@@ -1180,6 +1201,22 @@ async function loadPersistedState() {
     const saved = JSON.parse(file.content);
 
     if (saved.risk) Object.assign(state.risk, saved.risk);
+
+    // Migrate a trade saved in the old single-leg shape (pre scale-in)
+    // into the legs[] shape so a redeploy mid-trade can't crash resolution.
+    const ot = state.risk.openTrade;
+    if (ot && !Array.isArray(ot.legs)) {
+      state.risk.openTrade = {
+        signal: ot.signal,
+        legs: [
+          {
+            entryPrice: ot.entryPrice, sl: ot.sl, tp: ot.tp, entryTime: ot.entryTime,
+            strategy: ot.strategy, beMoved: !!ot.beMoved, addNumber: 0, riskUsd: RISK_PER_TRADE,
+            stopDist: 0, mfe: 0,
+          },
+        ],
+      };
+    }
     state.dailyReports = saved.dailyReports || [];
     state.strategySignals = saved.strategySignals || state.strategySignals;
     state.lastSignal = saved.lastSignal ?? null;
@@ -1250,7 +1287,7 @@ app.post("/api/trade-result", async (req, res) => {
       await applyTradeResult(
         result,
         "manual override",
-        { signal: open.signal, entryPrice: leg.entryPrice, sl: leg.sl, tp: leg.tp, strategy: leg.strategy, addNumber: leg.addNumber },
+        { signal: open.signal, entryPrice: leg.entryPrice, sl: leg.sl, tp: leg.tp, strategy: leg.strategy, addNumber: leg.addNumber, mfe: leg.mfe || 0, mfeR: leg.stopDist > 0 ? (leg.mfe || 0) / leg.stopDist : null },
         leg.riskUsd
       );
     }
