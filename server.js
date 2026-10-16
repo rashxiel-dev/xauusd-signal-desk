@@ -151,6 +151,13 @@ const state = {
   lastSignalStrategy: null,
   lastSignalReason: null,
   strategySignals: { emaCross: null, pullback: null, srBounce: null, breakout: null, rsiReversal: null },
+  // Win/loss tally per signal grade (A/B/C), kept separately from the
+  // 50-entry trade log so it accumulates over the whole run.
+  gradeStats: {
+    A: { trades: 0, wins: 0, losses: 0, breakevens: 0, pnl: 0 },
+    B: { trades: 0, wins: 0, losses: 0, breakevens: 0, pnl: 0 },
+    C: { trades: 0, wins: 0, losses: 0, breakevens: 0, pnl: 0 },
+  },
   regime: null,
   dailyReports: [], // { date, trades, wins, losses, winRate, pnl, byStrategy }[]
   history: [],
@@ -237,7 +244,16 @@ async function applyTradeResult(result, note, details, riskUsd = RISK_PER_TRADE)
     // you check whether breakeven is cutting off would-be winners
     mfe: details?.mfe ?? null,
     mfeR: details?.mfeR ?? null,
+    grade: details?.grade || null,
   });
+  const g = details?.grade && state.gradeStats[details.grade];
+  if (g) {
+    g.trades += 1;
+    if (result === "win") g.wins += 1;
+    else if (result === "breakeven") g.breakevens += 1;
+    else g.losses += 1;
+    g.pnl += amount;
+  }
   state.risk.log = state.risk.log.slice(0, 50);
   evaluateHalt();
   schedulePersist();
@@ -314,6 +330,7 @@ async function resolveOpenTrade(entryCandles) {
             addNumber: leg.addNumber,
             mfe: leg.mfe || 0,
             mfeR: leg.stopDist > 0 ? (leg.mfe || 0) / leg.stopDist : null,
+            grade: leg.grade || null,
           },
           leg.riskUsd
         );
@@ -743,7 +760,33 @@ async function sendTelegram(message) {
   }
 }
 
-function formatMessage(strategyName, signal, price, rsiVal, time, lot, reason, sl, tp, addNumber = 0) {
+// ---------------- Signal grading ----------------
+// Every signal still fires; the grade just says how much agrees with it:
+//  +1 higher-timeframe (H4) bias agrees with the direction
+//  +1 market regime suits the strategy (trend strategy in a matching
+//     trend, reversion strategy while ranging)
+//  +1 at least one OTHER strategy is signalling the same direction on
+//     this same candle (confluence)
+//  +1 London / New York hours (07:00-20:00 UTC), when gold is most liquid
+// A = 3-4 points, B = 2, C = 0-1.
+function gradeSignal(strat, signal, strategies, htfBias, entryRegime, now = new Date()) {
+  const reasons = [];
+  if ((signal === "BUY" && htfBias === "up") || (signal === "SELL" && htfBias === "down")) reasons.push("H4 trend");
+  const regimeOk =
+    strat.type === "trend"
+      ? (signal === "BUY" && entryRegime.trend === "trending-up") || (signal === "SELL" && entryRegime.trend === "trending-down")
+      : entryRegime.trend === "ranging";
+  if (regimeOk) reasons.push("regime");
+  const others = strategies.filter((o) => o.key !== strat.key && o.result && o.result.signal === signal);
+  if (others.length) reasons.push(`confluence (${others.map((o) => o.name).join(", ")})`);
+  const hour = now.getUTCHours();
+  if (hour >= 7 && hour < 20) reasons.push("London/NY hours");
+  const score = reasons.length;
+  const grade = score >= 3 ? "A" : score === 2 ? "B" : "C";
+  return { grade, score, reasons };
+}
+
+function formatMessage(strategyName, signal, price, rsiVal, time, lot, reason, sl, tp, addNumber = 0, gradeInfo = null) {
   const header = addNumber
     ? `*${signal} SCALE-IN ADD #${addNumber} — ${SYMBOL}* _(${strategyName})_`
     : `*${signal} SIGNAL — ${SYMBOL}* _(${strategyName})_`;
@@ -753,6 +796,7 @@ function formatMessage(strategyName, signal, price, rsiVal, time, lot, reason, s
     : `Suggested lot: ${lot ? lot.toFixed(2) : "—"} (risking $${RISK_PER_TRADE} on a $${ACCOUNT_SIZE} account)\n`;
   return (
     `${header}\n` +
+    (gradeInfo ? `Grade: *${gradeInfo.grade}* (${gradeInfo.score}/4 — ${gradeInfo.reasons.join(", ") || "base signal only"})\n` : "") +
     `Time: ${time}\n` +
     `Price: ${price.toFixed(2)}\n` +
     `RSI(${RSI_PERIOD}): ${rsiVal.toFixed(1)}\n` +
@@ -969,7 +1013,8 @@ async function checkOnce() {
     state.suggestedSL = sl;
     state.suggestedTP = tp;
     state.suggestedLot = lot;
-    state.history.unshift({ time, signal, price, strategy: strat.name, addNumber });
+    const gradeInfo = gradeSignal(strat, signal, strategies, htfBias, entryRegime);
+    state.history.unshift({ time, signal, price, strategy: strat.name, addNumber, grade: gradeInfo.grade });
     state.history = state.history.slice(0, 30);
 
     if (state.risk.halted) {
@@ -979,7 +1024,7 @@ async function checkOnce() {
       continue;
     }
 
-    const msg = formatMessage(strat.name, signal, price, rsiArr[i], time, lot, reason, sl, tp, addNumber);
+    const msg = formatMessage(strat.name, signal, price, rsiArr[i], time, lot, reason, sl, tp, addNumber, gradeInfo);
     await sendTelegram(msg);
     state.risk.tradesToday += 1;
 
@@ -987,7 +1032,7 @@ async function checkOnce() {
       state.risk.openTrade = {
         signal,
         legs: [
-          { entryPrice: price, sl, tp, entryTime: time, strategy: strat.name, beMoved: false, addNumber: 0, riskUsd: RISK_PER_TRADE, lot, stopDist: Math.abs(price - sl), mfe: 0 },
+          { entryPrice: price, sl, tp, entryTime: time, strategy: strat.name, beMoved: false, addNumber: 0, riskUsd: RISK_PER_TRADE, lot, stopDist: Math.abs(price - sl), mfe: 0, grade: gradeInfo.grade },
         ],
       };
     } else if (trackThis && addNumber > 0) {
@@ -1003,6 +1048,7 @@ async function checkOnce() {
         lot,
         stopDist: Math.abs(price - sl),
         mfe: 0,
+        grade: gradeInfo.grade,
       });
     } else {
       console.log(
@@ -1173,6 +1219,7 @@ function persistableSnapshot() {
     risk: state.risk,
     dailyReports: state.dailyReports,
     strategySignals: state.strategySignals,
+    gradeStats: state.gradeStats,
     lastSignal: state.lastSignal,
     lastSignalTime: state.lastSignalTime,
     lastSignalPrice: state.lastSignalPrice,
@@ -1225,6 +1272,7 @@ async function loadPersistedState() {
     state.lastSignalStrategy = saved.lastSignalStrategy ?? null;
     state.lastSignalReason = saved.lastSignalReason ?? null;
     state.history = saved.history || [];
+    if (saved.gradeStats) state.gradeStats = { ...state.gradeStats, ...saved.gradeStats };
 
     console.log(`Restored saved state from Gist (last saved ${saved.savedAt || "unknown time"}).`);
   } catch (err) {
@@ -1287,7 +1335,7 @@ app.post("/api/trade-result", async (req, res) => {
       await applyTradeResult(
         result,
         "manual override",
-        { signal: open.signal, entryPrice: leg.entryPrice, sl: leg.sl, tp: leg.tp, strategy: leg.strategy, addNumber: leg.addNumber, mfe: leg.mfe || 0, mfeR: leg.stopDist > 0 ? (leg.mfe || 0) / leg.stopDist : null },
+        { signal: open.signal, entryPrice: leg.entryPrice, sl: leg.sl, tp: leg.tp, strategy: leg.strategy, addNumber: leg.addNumber, mfe: leg.mfe || 0, mfeR: leg.stopDist > 0 ? (leg.mfe || 0) / leg.stopDist : null, grade: leg.grade || null },
         leg.riskUsd
       );
     }
@@ -1320,6 +1368,7 @@ app.post("/api/reset-challenge", (req, res) => {
   state.risk.log = [];
   state.risk.openTrade = null;
   state.risk.dayKey = todayKey();
+  for (const k of Object.keys(state.gradeStats)) state.gradeStats[k] = { trades: 0, wins: 0, losses: 0, breakevens: 0, pnl: 0 };
   state.strategySignals = { emaCross: null, pullback: null, srBounce: null, breakout: null, rsiReversal: null };
   schedulePersist();
   res.json({ ok: true, risk: state.risk });
