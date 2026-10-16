@@ -256,7 +256,7 @@ function render(state) {
     list.innerHTML = state.history
       .map(
         (h) =>
-          `<li><span class="history__signal is-${h.signal.toLowerCase()}">${h.signal}${h.strategy ? ` · ${h.strategy}` : ""}</span><span>${fmt(h.price)} · ${formatDateTime(h.time)}</span></li>`
+          `<li><span class="history__signal is-${h.signal.toLowerCase()}">${h.signal}${h.strategy ? ` · ${h.strategy}` : ""}${h.grade ? ` · ${h.grade}` : ""}</span><span>${fmt(h.price)} · ${formatDateTime(h.time)}</span></li>`
       )
       .join("");
   }
@@ -282,7 +282,7 @@ function render(state) {
   }
 
   // risk manager
-  if (state.risk) renderRisk(state.risk);
+  if (state.risk) renderRisk(state.risk, state.gradeStats);
 
   // daily reports
   renderReports(state.dailyReports || []);
@@ -348,7 +348,7 @@ function renderReports(reports) {
     .join("");
 }
 
-function renderRisk(risk) {
+function renderRisk(risk, gradeStats) {
   const banner = document.getElementById("risk-banner");
   if (risk.halted) {
     banner.style.display = "block";
@@ -402,6 +402,18 @@ function renderRisk(risk) {
     openEl.innerHTML = html;
   } else {
     openEl.style.display = "none";
+  }
+
+  const gradeEl = document.getElementById("grade-stats");
+  if (gradeEl && gradeStats) {
+    gradeEl.innerHTML = ["A", "B", "C"]
+      .map((g) => {
+        const s = gradeStats[g] || { trades: 0, wins: 0, losses: 0, breakevens: 0, pnl: 0 };
+        const decided = s.wins + s.losses;
+        const wr = decided ? `${((s.wins / decided) * 100).toFixed(0)}% win rate` : "no decided trades yet";
+        return `<li><span><strong>Grade ${g}</strong></span><span>${s.trades} trade(s) · ${s.wins}W/${s.losses}L/${s.breakevens}BE · ${wr} · ${s.pnl >= 0 ? "+" : ""}$${s.pnl.toFixed(2)}</span></li>`;
+      })
+      .join("");
   }
 
   const log = document.getElementById("risk-log");
