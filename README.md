@@ -64,6 +64,14 @@ pm2 save
 Env vars in `.env`: `SYMBOL`, `INTERVAL`. Strategy constants
 (EMA periods, RSI thresholds, SL/TP multipliers) are in `server.js`.
 
+### Breakeven
+The stop moves to entry once a trade is `BREAKEVEN_R` times its original
+stop distance in profit (default `1.0` = 1R), instead of a flat $2 that
+normal gold noise reaches constantly. Set `BREAKEVEN_R=0` to use the old
+flat `BREAKEVEN_TRIGGER_PIPS` trigger. Every closed trade logs its peak
+favorable move ("peak +$x (yR)") so you can check whether breakeven is
+cutting off winners.
+
 ### Scale-in rule
 If a strategy fires the same direction again while a trade is already open,
 it's treated as an **add** to that trade rather than a fresh signal — but
