@@ -411,7 +411,7 @@ function renderRisk(risk) {
     log.innerHTML = risk.log
       .map(
         (l) =>
-          `<li><span class="is-${l.result}">${l.result.toUpperCase()}${l.addNumber ? ` ADD#${l.addNumber}` : ""}</span><span>${l.amount >= 0 ? "+" : ""}$${l.amount.toFixed(2)} · ${timeAgo(l.time)}</span></li>`
+          `<li><span class="is-${l.result}">${l.result.toUpperCase()}${l.addNumber ? ` ADD#${l.addNumber}` : ""}</span><span>${l.amount >= 0 ? "+" : ""}$${l.amount.toFixed(2)} · ${timeAgo(l.time)}${l.mfe != null ? ` · peak +$${l.mfe.toFixed(2)}${l.mfeR != null ? ` (${l.mfeR.toFixed(1)}R)` : ""}` : ""}</span></li>`
       )
       .join("");
   }
