@@ -64,6 +64,14 @@ pm2 save
 Env vars in `.env`: `SYMBOL`, `INTERVAL`. Strategy constants
 (EMA periods, RSI thresholds, SL/TP multipliers) are in `server.js`.
 
+### Signal grades
+Every signal still fires, but gets a grade from 4 checks: H4 trend agrees,
+regime suits the strategy, another strategy signals the same direction on
+the same candle (confluence), and London/New York hours (07:00–20:00 UTC).
+A = 3–4 checks, B = 2, C = 0–1. The grade shows in the Telegram alert and
+signal history, and the dashboard tallies win rate per grade so you can see
+which grades are actually profitable and take only those.
+
 ### Breakeven
 The stop moves to entry once a trade is `BREAKEVEN_R` times its original
 stop distance in profit (default `1.0` = 1R), instead of a flat $2 that
