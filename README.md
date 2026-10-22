@@ -65,12 +65,21 @@ Env vars in `.env`: `SYMBOL`, `INTERVAL`. Strategy constants
 (EMA periods, RSI thresholds, SL/TP multipliers) are in `server.js`.
 
 ### Signal grades
-Every signal still fires, but gets a grade from 4 checks: H4 trend agrees,
-regime suits the strategy, another strategy signals the same direction on
-the same candle (confluence), and London/New York hours (07:00–20:00 UTC).
-A = 3–4 checks, B = 2, C = 0–1. The grade shows in the Telegram alert and
-signal history, and the dashboard tallies win rate per grade so you can see
-which grades are actually profitable and take only those.
+Every signal still fires, but gets a grade from independent checks:
+another strategy signalling the same direction (confluence), London/New
+York hours (07:00–20:00 UTC), EMA9 on the signal's side of EMA21, and RSI
+not already stretched. H4 trend and regime fit are only counted when the
+filters aren't already enforcing them, so trend strategies don't get free
+points. A = 75%+ of applicable checks AND another strategy agreeing (a lone
+signal is at best B), B = 50%+, C = below. The grade shows
+in the Telegram alert and signal history, and the dashboard tallies win
+rate per grade.
+
+### Turning a strategy off
+`DISABLED_STRATEGIES=pullback` (comma-separated keys: `emaCross`, `pullback`,
+`srBounce`, `breakout`, `rsiReversal`) silences those strategies while the
+rest keep running. Use `COOLDOWN_MINUTES` (e.g. `120`) to stop one strategy
+repeating the same signal every few candles.
 
 ### Breakeven
 The stop moves to entry once a trade is `BREAKEVEN_R` times its original
