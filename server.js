@@ -42,6 +42,12 @@ const SWING_WINDOW = 2; // candles on each side to qualify as a swing point
 const REQUIRE_TREND_ALIGNMENT = process.env.REQUIRE_TREND_ALIGNMENT !== "false";
 const REQUIRE_REGIME_MATCH = process.env.REQUIRE_REGIME_MATCH !== "false";
 const COOLDOWN_MINUTES = parseInt(process.env.COOLDOWN_MINUTES || "30", 10);
+// Comma-separated strategy keys to switch off while keeping the rest running:
+// emaCross, pullback, srBounce, breakout, rsiReversal. e.g. DISABLED_STRATEGIES=pullback
+const DISABLED_STRATEGIES = (process.env.DISABLED_STRATEGIES || "")
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
 
 const POLL_MS = 15 * 60 * 1000; // full candle + signal check, every 15 minutes
 const LIVE_POLL_MS = 3 * 60 * 1000; // lightweight price-only tick, every 3 minutes
@@ -761,29 +767,55 @@ async function sendTelegram(message) {
 }
 
 // ---------------- Signal grading ----------------
-// Every signal still fires; the grade just says how much agrees with it:
-//  +1 higher-timeframe (H4) bias agrees with the direction
-//  +1 market regime suits the strategy (trend strategy in a matching
-//     trend, reversion strategy while ranging)
-//  +1 at least one OTHER strategy is signalling the same direction on
-//     this same candle (confluence)
-//  +1 London / New York hours (07:00-20:00 UTC), when gold is most liquid
-// A = 3-4 points, B = 2, C = 0-1.
-function gradeSignal(strat, signal, strategies, htfBias, entryRegime, now = new Date()) {
-  const reasons = [];
-  if ((signal === "BUY" && htfBias === "up") || (signal === "SELL" && htfBias === "down")) reasons.push("H4 trend");
-  const regimeOk =
-    strat.type === "trend"
-      ? (signal === "BUY" && entryRegime.trend === "trending-up") || (signal === "SELL" && entryRegime.trend === "trending-down")
-      : entryRegime.trend === "ranging";
-  if (regimeOk) reasons.push("regime");
+// Every signal still fires; the grade says how many independent quality
+// checks agree with it. Checks that the active filters already guarantee
+// (H4 trend and regime match for trend strategies) are left OUT, so they
+// can't hand out free points:
+//  - confluence: another strategy signals the same direction this candle
+//  - session: London / New York hours (07:00-20:00 UTC), most liquid
+//  - momentum: EMA9 is on the signal's side of EMA21
+//  - RSI room: not already stretched (BUY below 65, SELL above 35)
+//  - H4 trend agrees   (only counted when not already enforced)
+//  - regime fits       (only counted when not already enforced)
+// Grade by share of applicable checks passed: A >= 75% AND confluence,
+// B >= 50%, else C.
+function gradeSignal(strat, signal, strategies, htfBias, entryRegime, ctx = {}, now = new Date()) {
+  const checks = [];
+  const add = (name, ok) => checks.push({ name, ok: !!ok });
+
   const others = strategies.filter((o) => o.key !== strat.key && o.result && o.result.signal === signal);
-  if (others.length) reasons.push(`confluence (${others.map((o) => o.name).join(", ")})`);
+  add(others.length ? `confluence (${others.map((o) => o.name).join(", ")})` : "confluence", others.length > 0);
+
   const hour = now.getUTCHours();
-  if (hour >= 7 && hour < 20) reasons.push("London/NY hours");
-  const score = reasons.length;
-  const grade = score >= 3 ? "A" : score === 2 ? "B" : "C";
-  return { grade, score, reasons };
+  add("London/NY hours", hour >= 7 && hour < 20);
+
+  if (ctx.emaFast != null && ctx.emaSlow != null) {
+    add("EMA momentum", signal === "BUY" ? ctx.emaFast > ctx.emaSlow : ctx.emaFast < ctx.emaSlow);
+  }
+  if (ctx.rsi != null) {
+    add("RSI room", signal === "BUY" ? ctx.rsi < 65 : ctx.rsi > 35);
+  }
+
+  const trendEnforced = strat.type === "trend" && REQUIRE_TREND_ALIGNMENT;
+  if (!trendEnforced) {
+    add("H4 trend", (signal === "BUY" && htfBias === "up") || (signal === "SELL" && htfBias === "down"));
+  }
+  const regimeEnforced = REQUIRE_REGIME_MATCH;
+  if (!regimeEnforced) {
+    const regimeOk =
+      strat.type === "trend"
+        ? (signal === "BUY" && entryRegime.trend === "trending-up") || (signal === "SELL" && entryRegime.trend === "trending-down")
+        : entryRegime.trend === "ranging";
+    add("regime", regimeOk);
+  }
+
+  const passed = checks.filter((c) => c.ok);
+  const total = checks.length;
+  const ratio = total ? passed.length / total : 0;
+  // A requires confluence: a lone signal from one strategy can be at best B.
+  const hasConfluence = others.length > 0;
+  const grade = ratio >= 0.75 && hasConfluence ? "A" : ratio >= 0.5 ? "B" : "C";
+  return { grade, score: passed.length, total, reasons: passed.map((c) => c.name) };
 }
 
 function formatMessage(strategyName, signal, price, rsiVal, time, lot, reason, sl, tp, addNumber = 0, gradeInfo = null) {
@@ -796,7 +828,7 @@ function formatMessage(strategyName, signal, price, rsiVal, time, lot, reason, s
     : `Suggested lot: ${lot ? lot.toFixed(2) : "—"} (risking $${RISK_PER_TRADE} on a $${ACCOUNT_SIZE} account)\n`;
   return (
     `${header}\n` +
-    (gradeInfo ? `Grade: *${gradeInfo.grade}* (${gradeInfo.score}/4 — ${gradeInfo.reasons.join(", ") || "base signal only"})\n` : "") +
+    (gradeInfo ? `Grade: *${gradeInfo.grade}* (${gradeInfo.score}/${gradeInfo.total} — ${gradeInfo.reasons.join(", ") || "none passed"})\n` : "") +
     `Time: ${time}\n` +
     `Price: ${price.toFixed(2)}\n` +
     `RSI(${RSI_PERIOD}): ${rsiVal.toFixed(1)}\n` +
@@ -913,6 +945,11 @@ async function checkOnce() {
     },
   ];
 
+  // Switch off any strategies listed in DISABLED_STRATEGIES
+  for (const strat of strategies) {
+    if (DISABLED_STRATEGIES.includes(strat.key)) strat.result = null;
+  }
+
   state.signal = strategies.find((s) => s.result)?.result.signal || null;
 
   const nowMs = Date.now();
@@ -1013,7 +1050,11 @@ async function checkOnce() {
     state.suggestedSL = sl;
     state.suggestedTP = tp;
     state.suggestedLot = lot;
-    const gradeInfo = gradeSignal(strat, signal, strategies, htfBias, entryRegime);
+    const gradeInfo = gradeSignal(strat, signal, strategies, htfBias, entryRegime, {
+      emaFast: emaFastArr[i],
+      emaSlow: emaSlowArr[i],
+      rsi: rsiArr[i],
+    });
     state.history.unshift({ time, signal, price, strategy: strat.name, addNumber, grade: gradeInfo.grade });
     state.history = state.history.slice(0, 30);
 
