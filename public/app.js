@@ -282,7 +282,7 @@ function render(state) {
   }
 
   // risk manager
-  if (state.risk) renderRisk(state.risk, state.gradeStats);
+  if (state.risk) renderRisk(state.risk, state.gradeStats, state.challenge);
 
   // daily reports
   renderReports(state.dailyReports || []);
@@ -348,13 +348,15 @@ function renderReports(reports) {
     .join("");
 }
 
-function renderRisk(risk, gradeStats) {
+function renderRisk(risk, gradeStats, challenge) {
   const banner = document.getElementById("risk-banner");
   if (risk.halted) {
     banner.style.display = "block";
     banner.textContent =
       risk.haltReason === "max"
         ? `Max loss limit reached ($${risk.maxLossLimit}) — new trade alerts are suppressed until you reset the challenge.`
+        : risk.haltReason === "target"
+        ? `Daily target reached (+$${risk.dailyProfitTarget}) — new alerts are paused until tomorrow to lock in the day.`
         : `Daily loss limit reached ($${risk.dailyLossLimit}) — new trade alerts are paused until the day resets.`;
   } else {
     banner.style.display = "none";
@@ -402,6 +404,22 @@ function renderRisk(risk, gradeStats) {
     openEl.innerHTML = html;
   } else {
     openEl.style.display = "none";
+  }
+
+  const tgt = risk.dailyProfitTarget || 0;
+  const tFill = document.getElementById("target-fill");
+  if (tFill && tgt > 0) {
+    const pct = Math.max(0, Math.min(100, (risk.dailyPnL / tgt) * 100));
+    tFill.style.width = `${pct}%`;
+    document.getElementById("target-label").textContent = `/ +$${tgt}`;
+    document.getElementById("target-value").textContent =
+      `${risk.dailyPnL >= 0 ? "+" : ""}$${risk.dailyPnL.toFixed(2)}${risk.dailyPnL >= tgt ? " — target reached" : ""}`;
+    const rec = document.getElementById("challenge-record");
+    if (rec && challenge) {
+      rec.textContent = challenge.tradedDays
+        ? `Target hit on ${challenge.daysHit} of ${challenge.tradedDays} trading day(s) · current streak ${challenge.streak} · best ${challenge.bestDay >= 0 ? "+" : ""}$${challenge.bestDay.toFixed(2)} · worst ${challenge.worstDay >= 0 ? "+" : ""}$${challenge.worstDay.toFixed(2)}`
+        : "No completed trading days yet.";
+    }
   }
 
   const gradeEl = document.getElementById("grade-stats");
