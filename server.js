@@ -57,6 +57,9 @@ const ACCOUNT_SIZE = parseFloat(process.env.ACCOUNT_SIZE || "5000");
 const DAILY_LOSS_LIMIT = parseFloat(process.env.DAILY_LOSS_LIMIT || "200");
 const MAX_LOSS_LIMIT = parseFloat(process.env.MAX_LOSS_LIMIT || "350");
 const PROFIT_TARGET = parseFloat(process.env.PROFIT_TARGET || "500");
+// Daily challenge: once the day's P&L reaches this, alerts pause until
+// the next local day (lock in the win). Set 0 to disable.
+const DAILY_PROFIT_TARGET = parseFloat(process.env.DAILY_PROFIT_TARGET || "10");
 const RISK_PER_TRADE = parseFloat(process.env.RISK_PER_TRADE || "50");
 // Move SL to entry (breakeven) once a trade is this many pips in favor.
 // This broker counts 1 pip as $0.10 on XAUUSD, so 20 pips = $2.00.
@@ -82,7 +85,9 @@ const XAU_LOT_USD_PER_POINT = 100; // 1.00 lot XAUUSD ≈ $100 per $1 move (100o
 // risk (not the full RISK_PER_TRADE), and capped per trade.
 const SCALE_IN_ENABLED = process.env.SCALE_IN_ENABLED !== "false";
 const SCALE_IN_RISK_PCT = parseFloat(process.env.SCALE_IN_RISK_PCT || "0.5");
-const SCALE_IN_RISK_USD = (ACCOUNT_SIZE * SCALE_IN_RISK_PCT) / 100;
+// Never larger than half of the normal per-trade risk, so a small
+// challenge-sized RISK_PER_TRADE can't be exceeded by an add.
+const SCALE_IN_RISK_USD = Math.min((ACCOUNT_SIZE * SCALE_IN_RISK_PCT) / 100, RISK_PER_TRADE * 0.5);
 const SCALE_IN_MAX_ADDS = parseInt(process.env.SCALE_IN_MAX_ADDS || "1", 10);
 
 // Your local timezone as a fixed UTC offset (hours), used only for the
@@ -177,6 +182,8 @@ const state = {
     dailyLossLimit: DAILY_LOSS_LIMIT,
     maxLossLimit: MAX_LOSS_LIMIT,
     profitTarget: PROFIT_TARGET,
+    dailyProfitTarget: DAILY_PROFIT_TARGET,
+    targetNotified: null,
     riskPerTrade: RISK_PER_TRADE,
     dailyPnL: 0,
     totalPnL: 0,
@@ -189,8 +196,10 @@ const state = {
   },
 };
 
+// The "day" for the daily target / loss limit follows YOUR local midnight
+// (TIMEZONE_OFFSET_HOURS), same as the daily report.
 function todayKey() {
-  return new Date().toISOString().slice(0, 10);
+  return localDateKeyFor(new Date());
 }
 
 function resetDailyIfNeeded() {
@@ -199,7 +208,7 @@ function resetDailyIfNeeded() {
     state.risk.dayKey = key;
     state.risk.dailyPnL = 0;
     state.risk.tradesToday = 0;
-    if (state.risk.haltReason === "daily") {
+    if (state.risk.haltReason === "daily" || state.risk.haltReason === "target") {
       state.risk.halted = false;
       state.risk.haltReason = null;
     }
@@ -213,6 +222,10 @@ function evaluateHalt() {
   } else if (state.risk.dailyPnL <= -DAILY_LOSS_LIMIT) {
     state.risk.halted = true;
     state.risk.haltReason = "daily";
+  } else if (DAILY_PROFIT_TARGET > 0 && state.risk.dailyPnL >= DAILY_PROFIT_TARGET && !state.risk.halted) {
+    // Daily target reached: lock the day in and pause new alerts.
+    state.risk.halted = true;
+    state.risk.haltReason = "target";
   }
 }
 
@@ -263,6 +276,14 @@ async function applyTradeResult(result, note, details, riskUsd = RISK_PER_TRADE)
   state.risk.log = state.risk.log.slice(0, 50);
   evaluateHalt();
   schedulePersist();
+
+  if (state.risk.haltReason === "target" && state.risk.targetNotified !== state.risk.dayKey) {
+    state.risk.targetNotified = state.risk.dayKey;
+    await sendTelegram(
+      `🎯 *Daily target reached* — today's P&L is +$${state.risk.dailyPnL.toFixed(2)} (target +$${DAILY_PROFIT_TARGET}).\n` +
+        `New alerts are paused until tomorrow so the day stays green. Any trade still open keeps being tracked.`
+    );
+  }
 
   if (details) {
     const emoji = result === "win" ? "✅" : result === "breakeven" ? "⚪" : "❌";
@@ -818,6 +839,16 @@ function gradeSignal(strat, signal, strategies, htfBias, entryRegime, ctx = {}, 
   return { grade, score: passed.length, total, reasons: passed.map((c) => c.name) };
 }
 
+// Candle times from the data feed are UTC ("YYYY-MM-DD HH:MM:SS"). Show
+// them in the user's local time (TIMEZONE_OFFSET_HOURS) in Telegram alerts.
+function formatLocalTime(utcString) {
+  const d = new Date(String(utcString).replace(" ", "T") + "Z");
+  if (isNaN(d.getTime())) return String(utcString);
+  const local = new Date(d.getTime() + TIMEZONE_OFFSET_HOURS * 3600 * 1000);
+  const sign = TIMEZONE_OFFSET_HOURS >= 0 ? "+" : "-";
+  return `${local.toISOString().slice(0, 16).replace("T", " ")} (UTC${sign}${Math.abs(TIMEZONE_OFFSET_HOURS)})`;
+}
+
 function formatMessage(strategyName, signal, price, rsiVal, time, lot, reason, sl, tp, addNumber = 0, gradeInfo = null) {
   const header = addNumber
     ? `*${signal} SCALE-IN ADD #${addNumber} — ${SYMBOL}* _(${strategyName})_`
@@ -829,7 +860,7 @@ function formatMessage(strategyName, signal, price, rsiVal, time, lot, reason, s
   return (
     `${header}\n` +
     (gradeInfo ? `Grade: *${gradeInfo.grade}* (${gradeInfo.score}/${gradeInfo.total} — ${gradeInfo.reasons.join(", ") || "none passed"})\n` : "") +
-    `Time: ${time}\n` +
+    `Time: ${formatLocalTime(time)}\n` +
     `Price: ${price.toFixed(2)}\n` +
     `RSI(${RSI_PERIOD}): ${rsiVal.toFixed(1)}\n` +
     `${reason}\n` +
@@ -1197,6 +1228,13 @@ function formatDailyReportMessage(r) {
     `Trades: ${r.trades} (${r.wins}W / ${r.losses}L / ${r.breakevens || 0}BE${r.trades ? `, ${r.winRate.toFixed(0)}% win rate` : ""})`,
     `Net P&L: ${r.pnl >= 0 ? "+" : ""}$${r.pnl.toFixed(2)}`,
   ];
+  if (r.trades && DAILY_PROFIT_TARGET > 0) {
+    lines.push(
+      r.pnl >= DAILY_PROFIT_TARGET
+        ? `🎯 Daily target (+$${DAILY_PROFIT_TARGET}): HIT`
+        : `Daily target (+$${DAILY_PROFIT_TARGET}): missed by $${(DAILY_PROFIT_TARGET - r.pnl).toFixed(2)}`
+    );
+  }
   if (r.trades) {
     lines.push("", "By strategy:");
     Object.entries(r.byStrategy).forEach(([name, s]) => {
@@ -1353,8 +1391,31 @@ const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
+// Daily-challenge record built from the daily reports: on how many
+// trading days (days with at least one resolved trade) the daily target
+// was reached, plus the current streak of consecutive hits.
+function buildChallengeSummary() {
+  const target = DAILY_PROFIT_TARGET;
+  const traded = state.dailyReports.filter((r) => r.trades > 0); // newest first
+  const daysHit = traded.filter((r) => r.pnl >= target).length;
+  let streak = 0;
+  for (const r of traded) {
+    if (r.pnl >= target) streak += 1;
+    else break;
+  }
+  return {
+    target,
+    tradedDays: traded.length,
+    daysHit,
+    daysMissed: traded.length - daysHit,
+    streak,
+    bestDay: traded.length ? Math.max(...traded.map((r) => r.pnl)) : 0,
+    worstDay: traded.length ? Math.min(...traded.map((r) => r.pnl)) : 0,
+  };
+}
+
 app.get("/api/status", (req, res) => {
-  res.json({ ...state, marketTransition: findNextMarketTransition() });
+  res.json({ ...state, challenge: buildChallengeSummary(), marketTransition: findNextMarketTransition() });
 });
 
 // Log the outcome of the currently open trade (manual override — the
@@ -1392,7 +1453,8 @@ app.post("/api/reset-day", (req, res) => {
   state.risk.dailyPnL = 0;
   state.risk.tradesToday = 0;
   state.risk.dayKey = todayKey();
-  if (state.risk.haltReason === "daily") {
+  state.risk.targetNotified = null;
+  if (state.risk.haltReason === "daily" || state.risk.haltReason === "target") {
     state.risk.halted = false;
     state.risk.haltReason = null;
   }
