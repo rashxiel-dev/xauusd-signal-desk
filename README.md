@@ -64,6 +64,21 @@ pm2 save
 Env vars in `.env`: `SYMBOL`, `INTERVAL`. Strategy constants
 (EMA periods, RSI thresholds, SL/TP multipliers) are in `server.js`.
 
+### Daily challenge mode
+The bot runs like a daily prop-firm challenge. `DAILY_PROFIT_TARGET`
+(default `10`) is your daily goal: once the day's P&L reaches it, new
+alerts pause until your next local midnight so a green day stays green, and
+Telegram tells you. `DAILY_LOSS_LIMIT` pauses alerts the same way after a
+bad day. The dashboard shows progress to the target and a record of how many
+trading days hit it, plus your current streak. The "day" follows your own
+midnight (`TIMEZONE_OFFSET_HOURS`). Nothing can guarantee a green day —
+this limits damage and locks in wins, it does not remove losing days.
+
+Suggested Render settings for a small challenge:
+`RISK_PER_TRADE=10`, `DAILY_PROFIT_TARGET=10`, `DAILY_LOSS_LIMIT=25`,
+`MAX_LOSS_LIMIT=100`, `PROFIT_TARGET=200`, `COOLDOWN_MINUTES=120`.
+(A win pays about 1.67x the risk, so a $10 risk wins about $16.67.)
+
 ### Signal grades
 Every signal still fires, but gets a grade from independent checks:
 another strategy signalling the same direction (confluence), London/New
